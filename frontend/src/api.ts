@@ -26,8 +26,9 @@ export const exportAudio = async (
   regions: Region[],
   mode: ExportMode,
   format: ExportFormat,
+  chunkDurationSec?: number,
 ) => {
-  const { data } = await api.post("/export", { fileId, regions, mode, format });
+  const { data } = await api.post("/export", { fileId, regions, mode, format, chunkDurationSec });
   return data as { files: Array<{ path: string; label: string }> };
 };
 

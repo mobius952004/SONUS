@@ -36,6 +36,8 @@ function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<ExportMode>("full");
   const [exportFormat, setExportFormat] = useState<ExportFormat>("wav");
+  const [chunkSplitMode, setChunkSplitMode] = useState<"selectedRanges" | "fixedDuration">("selectedRanges");
+  const [fixedChunkDurationSec, setFixedChunkDurationSec] = useState(30);
   const [exports, setExports] = useState<Array<{ path: string; label: string }>>([]);
   const [processedPreviews, setProcessedPreviews] = useState<Array<{ fileId: string; path: string; createdAt: number }>>([]);
   const [originalPreview, setOriginalPreview] = useState<{ fileId: string; path: string } | null>(null);
@@ -320,7 +322,14 @@ function App() {
     try {
       const chosenRegions =
         exportMode === "full" ? [] : regions.filter((region) => selectedExportRegionIds.includes(region.id));
-      const result = await exportAudio(fileId, chosenRegions, exportMode, exportFormat);
+      const useFixedDuration = exportMode === "chunks" && chunkSplitMode === "fixedDuration";
+      const result = await exportAudio(
+        fileId,
+        useFixedDuration ? [] : chosenRegions,
+        exportMode,
+        exportFormat,
+        useFixedDuration ? fixedChunkDurationSec : undefined,
+      );
       setExports(result.files);
     } catch (error) {
       setErrorModal((error as Error).message || "Export failed.");
@@ -859,6 +868,31 @@ function App() {
                 <option value="selected">Selected regions only</option>
                 <option value="chunks">Split into chunks</option>
               </select>
+              {exportMode === "chunks" && (
+                <>
+                  <select
+                    className="field"
+                    value={chunkSplitMode}
+                    onChange={(e) => setChunkSplitMode(e.target.value as "selectedRanges" | "fixedDuration")}
+                  >
+                    <option value="selectedRanges">Use selected ranges as chunks</option>
+                    <option value="fixedDuration">Auto-split by fixed duration</option>
+                  </select>
+                  {chunkSplitMode === "fixedDuration" && (
+                    <label className="block">
+                      Chunk duration (seconds)
+                      <input
+                        className="field mt-1"
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={fixedChunkDurationSec}
+                        onChange={(e) => setFixedChunkDurationSec(Math.max(1, Number(e.target.value) || 1))}
+                      />
+                    </label>
+                  )}
+                </>
+              )}
               <select className="field" value={exportFormat} onChange={(e) => setExportFormat(e.target.value as ExportFormat)}>
                 <option value="wav">.wav</option>
                 <option value="mp3">.mp3</option>
