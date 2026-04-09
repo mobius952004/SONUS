@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+.btn {
+  @apply rounded border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+.panel {
+  @apply rounded-xl bg-white p-4 shadow;
+}
+
+.panel-title {
+  @apply mb-2 text-base font-semibold;
+}
+
+.field {
+  @apply w-full rounded border border-slate-300 px-2 py-1;
+}
