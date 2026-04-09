@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
+import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 import TimelinePlugin from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import { analyzeAudio, exportAudio, mediaUrl, processAudio, uploadAudio } from "./api";
 import { hasOverlap, isValidRange, nextRegionWindow, withUpdatedRegion } from "./lib/regions";
@@ -24,11 +25,13 @@ type BatchItem = {
 function App() {
   const waveformRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const spectrogramRef = useRef<HTMLDivElement | null>(null);
   const signalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
   const regionsPluginRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
   const lastUiTickRef = useRef(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [showSpectrogram, setShowSpectrogram] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [zoom, setZoom] = useState(50);
@@ -39,6 +42,8 @@ function App() {
   const [chunkSplitMode, setChunkSplitMode] = useState<"selectedRanges" | "fixedDuration">("selectedRanges");
   const [fixedChunkDurationSec, setFixedChunkDurationSec] = useState(30);
   const [exports, setExports] = useState<Array<{ path: string; label: string }>>([]);
+  const [autoDownloadOnExport, setAutoDownloadOnExport] = useState(true);
+  const [openPreviewOnExport, setOpenPreviewOnExport] = useState(true);
   const [processedPreviews, setProcessedPreviews] = useState<Array<{ fileId: string; path: string; createdAt: number }>>([]);
   const [originalPreview, setOriginalPreview] = useState<{ fileId: string; path: string } | null>(null);
   const [wavePreviewMode, setWavePreviewMode] = useState<"current" | "original" | "processed">("current");
@@ -110,7 +115,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (!waveformRef.current || !timelineRef.current || waveSurferRef.current) return;
+    if (!waveformRef.current || !timelineRef.current || !spectrogramRef.current || waveSurferRef.current) return;
     const regionsPlugin = RegionsPlugin.create();
     regionsPluginRef.current = regionsPlugin;
     const ws = WaveSurfer.create({
@@ -121,7 +126,16 @@ function App() {
       minPxPerSec: 50,
       height: 160,
       normalize: true,
-      plugins: [regionsPlugin, TimelinePlugin.create({ container: timelineRef.current })],
+      plugins: [
+        regionsPlugin,
+        TimelinePlugin.create({ container: timelineRef.current }),
+        SpectrogramPlugin.create({
+          container: spectrogramRef.current,
+          labels: true,
+          splitChannels: false,
+          scale: "mel",
+        }),
+      ],
     });
     waveSurferRef.current = ws;
 
@@ -318,6 +332,7 @@ function App() {
 
   const runExport = async () => {
     if (!fileId) return;
+    const previewWindow = openPreviewOnExport ? window.open("about:blank", "_blank") : null;
     setBusy("Exporting...");
     try {
       const chosenRegions =
@@ -331,7 +346,28 @@ function App() {
         useFixedDuration ? fixedChunkDurationSec : undefined,
       );
       setExports(result.files);
+
+      if (result.files.length > 0 && previewWindow) {
+        previewWindow.location.href = mediaUrl(result.files[0].path);
+      } else if (previewWindow) {
+        previewWindow.close();
+      }
+
+      if (autoDownloadOnExport) {
+        result.files.forEach((file, index) => {
+          const link = document.createElement("a");
+          link.href = mediaUrl(file.path);
+          link.download = file.path.split("/").pop() ?? `export-${index + 1}.${exportFormat}`;
+          link.rel = "noopener";
+          document.body.appendChild(link);
+          window.setTimeout(() => {
+            link.click();
+            link.remove();
+          }, index * 120);
+        });
+      }
     } catch (error) {
+      if (previewWindow) previewWindow.close();
       setErrorModal((error as Error).message || "Export failed.");
     } finally {
       setBusy(null);
@@ -581,8 +617,15 @@ function App() {
                 <span className="text-xs text-amber-700">Preview mode active (range edits apply to current file).</span>
               )}
             </div>
+            <div className="mb-2 flex items-center gap-2">
+              <button className={`btn ${showSpectrogram ? "!bg-slate-900 !text-white" : ""}`} onClick={() => setShowSpectrogram((v) => !v)}>
+                {showSpectrogram ? "Hide Spectrogram" : "Show Spectrogram"}
+              </button>
+              <span className="text-xs text-slate-500">Use spectrogram for noise/hum/hiss artifact inspection.</span>
+            </div>
             <div ref={waveformRef} />
             <div ref={timelineRef} className="mt-2" />
+            <div ref={spectrogramRef} className={`mt-2 overflow-x-auto rounded border ${showSpectrogram ? "block" : "hidden"}`} />
             <div className="mt-3 overflow-hidden">
               <p className="mb-1 text-xs font-medium text-slate-600">1D Signal Visualization (oscilloscope)</p>
               <canvas ref={signalCanvasRef} width={1000} height={110} className="h-28 w-full rounded border border-slate-300" />
@@ -897,6 +940,14 @@ function App() {
                 <option value="wav">.wav</option>
                 <option value="mp3">.mp3</option>
               </select>
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={autoDownloadOnExport} onChange={(e) => setAutoDownloadOnExport(e.target.checked)} />
+                Auto-download all exported files/chunks
+              </label>
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={openPreviewOnExport} onChange={(e) => setOpenPreviewOnExport(e.target.checked)} />
+                Open exported audio preview in new tab
+              </label>
               <button className="btn w-full" onClick={runExport} disabled={!fileId}>
                 Export Audio
               </button>
