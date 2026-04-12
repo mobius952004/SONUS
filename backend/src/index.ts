@@ -9,8 +9,10 @@ import {
   analyzeAudio,
   convertToStandardWav,
   exportChunks,
+  exportChunksByDuration,
   exportFullAudio,
   exportSelectedRegions,
+  removeTimeRangesFromAudio,
   type FiltersPayload,
   type Region,
 } from "./ffmpegService";
@@ -96,13 +98,29 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
+app.post("/remove-ranges", async (req, res) => {
+  try {
+    const { fileId, regions } = req.body as { fileId: string; regions: Region[] };
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const safeRegions = Array.isArray(regions) ? regions : [];
+    const outputId = randomUUID();
+    const outputPath = sourcePathFor(outputId);
+    await removeTimeRangesFromAudio(inputPath, outputPath, safeRegions);
+    res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
+  } catch (error) {
+    res.status(500).json({ message: (error as Error).message });
+  }
+});
+
 app.post("/export", async (req, res) => {
   try {
-    const { fileId, regions, mode, format } = req.body as {
+    const { fileId, regions, mode, format, chunkDurationSec } = req.body as {
       fileId: string;
       regions: Region[];
       mode: "full" | "selected" | "chunks";
       format: "wav" | "mp3";
+      chunkDurationSec?: number;
     };
     const inputPath = sourcePathFor(fileId);
     await fs.access(inputPath);
@@ -111,7 +129,10 @@ app.post("/export", async (req, res) => {
 
     if (mode === "chunks") {
       const outDir = path.join(exportsDir, exportId);
-      const chunkPaths = await exportChunks(inputPath, outDir, exportId, format, safeRegions);
+      const chunkPaths =
+        Number.isFinite(chunkDurationSec) && (chunkDurationSec ?? 0) > 0
+          ? await exportChunksByDuration(inputPath, outDir, exportId, format, Number(chunkDurationSec))
+          : await exportChunks(inputPath, outDir, exportId, format, safeRegions);
       const files = chunkPaths.map((item, idx) => ({
         path: `/media/exports/${exportId}/${path.basename(item)}`,
         label: `Chunk ${idx + 1}`,

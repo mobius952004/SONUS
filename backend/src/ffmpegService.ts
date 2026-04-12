@@ -108,6 +108,61 @@ export const exportSelectedRegions = async (inputPath: string, outputPath: strin
   await runFfmpeg(["-i", inputPath, "-filter_complex", filterComplex, "-map", "[out]", outputPath]);
 };
 
+const mergeIntervals = (intervals: { start: number; end: number }[]) => {
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  const merged: { start: number; end: number }[] = [];
+  for (const iv of sorted) {
+    if (!merged.length || iv.start > merged[merged.length - 1].end) {
+      merged.push({ ...iv });
+    } else {
+      merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, iv.end);
+    }
+  }
+  return merged;
+};
+
+/** Removes the given time ranges from the audio and concatenates the remainder (new file, shorter duration). */
+export const removeTimeRangesFromAudio = async (inputPath: string, outputPath: string, removeRegions: Region[]) => {
+  await ensureDir(path.dirname(outputPath));
+  const probe = await runTool(ffprobeBinary, ["-v", "error", "-show_format", "-of", "json", inputPath]);
+  if (probe.code !== 0) throw new Error("Failed to read audio duration for cut.");
+  const probeJson = JSON.parse(probe.stdout) as { format?: { duration?: string } };
+  const durationSec = Number(probeJson.format?.duration ?? 0);
+  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("Invalid audio duration.");
+
+  const clamped = removeRegions
+    .filter((r) => r.end > r.start)
+    .map((r) => ({
+      start: Math.max(0, r.start),
+      end: Math.min(durationSec, r.end),
+    }))
+    .filter((r) => r.end > r.start);
+
+  const mergedRemove = mergeIntervals(clamped);
+  if (!mergedRemove.length) throw new Error("No valid ranges to remove.");
+
+  const keep: { start: number; end: number }[] = [];
+  let cursor = 0;
+  for (const r of mergedRemove) {
+    if (r.start > cursor) {
+      keep.push({ start: cursor, end: r.start });
+    }
+    cursor = Math.max(cursor, r.end);
+  }
+  if (cursor < durationSec) {
+    keep.push({ start: cursor, end: durationSec });
+  }
+  const validKeep = keep.filter((k) => k.end > k.start);
+  if (!validKeep.length) throw new Error("Removing these ranges would delete the entire file.");
+
+  const filterParts = validKeep.map(
+    (seg, index) => `[0:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS[a${index}]`,
+  );
+  const concatInputs = validKeep.map((_, index) => `[a${index}]`).join("");
+  const filterComplex = `${filterParts.join(";")};${concatInputs}concat=n=${validKeep.length}:v=0:a=1[out]`;
+  await runFfmpeg(["-i", inputPath, "-filter_complex", filterComplex, "-map", "[out]", outputPath]);
+};
+
 export const exportChunks = async (inputPath: string, outputDir: string, baseName: string, ext: "wav" | "mp3", regions: Region[]) => {
   await ensureDir(outputDir);
   const validRegions = regions.filter((r) => r.start >= 0 && r.end > r.start).sort((a, b) => a.start - b.start);
@@ -118,6 +173,33 @@ export const exportChunks = async (inputPath: string, outputDir: string, baseNam
     const outputPath = path.join(outputDir, `${baseName}-chunk-${i + 1}.${ext}`);
     await runFfmpeg(["-i", inputPath, "-ss", `${region.start}`, "-to", `${region.end}`, outputPath]);
     outputs.push(outputPath);
+  }
+  return outputs;
+};
+
+export const exportChunksByDuration = async (
+  inputPath: string,
+  outputDir: string,
+  baseName: string,
+  ext: "wav" | "mp3",
+  chunkDurationSec: number,
+) => {
+  await ensureDir(outputDir);
+  const safeChunkDuration = Math.max(1, Math.min(3600, chunkDurationSec));
+  const probe = await runTool(ffprobeBinary, ["-v", "error", "-show_format", "-of", "json", inputPath]);
+  if (probe.code !== 0) throw new Error("Failed to read audio duration for chunk export.");
+  const probeJson = JSON.parse(probe.stdout) as { format?: { duration?: string } };
+  const durationSec = Number(probeJson.format?.duration ?? 0);
+  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("Invalid audio duration.");
+
+  const outputs: string[] = [];
+  let chunkIndex = 1;
+  for (let start = 0; start < durationSec; start += safeChunkDuration) {
+    const end = Math.min(durationSec, start + safeChunkDuration);
+    const outputPath = path.join(outputDir, `${baseName}-chunk-${chunkIndex}.${ext}`);
+    await runFfmpeg(["-i", inputPath, "-ss", `${start}`, "-to", `${end}`, outputPath]);
+    outputs.push(outputPath);
+    chunkIndex += 1;
   }
   return outputs;
 };

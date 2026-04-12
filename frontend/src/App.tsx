@@ -3,7 +3,7 @@ import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 import TimelinePlugin from "wavesurfer.js/dist/plugins/timeline.esm.js";
-import { analyzeAudio, exportAudio, mediaUrl, processAudio, uploadAudio } from "./api";
+import { analyzeAudio, exportAudio, mediaUrl, processAudio, removeRangesFromAudio, uploadAudio } from "./api";
 import { hasOverlap, isValidRange, nextRegionWindow, withUpdatedRegion } from "./lib/regions";
 import { useEditorStore } from "./store/editorStore";
 import type { AudioAnalysis, ExportFormat, ExportMode, Region } from "./types";
@@ -330,6 +330,23 @@ function App() {
     }
   };
 
+  const cutSelectedRangeFromAudio = async () => {
+    if (!fileId || !selectedRegion) return;
+    setBusy("Removing selected range from audio...");
+    try {
+      const result = await removeRangesFromAudio(fileId, [selectedRegion]);
+      setAudioFile(result.fileId, mediaUrl(result.path));
+      setExports([]);
+      setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
+      setWavePreviewMode("current");
+      setAnalysis(null);
+    } catch (error) {
+      setErrorModal((error as Error).message || "Could not remove range from audio.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const runExport = async () => {
     if (!fileId) return;
     const previewWindow = openPreviewOnExport ? window.open("about:blank", "_blank") : null;
@@ -574,6 +591,14 @@ function App() {
             </button>
             <button className="btn" onClick={removeRegion} disabled={!selectedRegionId}>
               Remove Range
+            </button>
+            <button
+              className="btn !border-rose-200 !bg-rose-50 !text-rose-900 hover:!bg-rose-100"
+              onClick={cutSelectedRangeFromAudio}
+              disabled={!fileId || !selectedRegion}
+              title="FFmpeg removes the highlighted time range and loads the shorter clip as the new current file."
+            >
+              Cut selection from audio
             </button>
             <button className="btn" onClick={undo}>
               Undo

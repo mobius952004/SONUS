@@ -36,3 +36,8 @@ export const analyzeAudio = async (fileId: string) => {
   const { data } = await api.post("/analyze", { fileId });
   return data as AudioAnalysis;
 };
+
+export const removeRangesFromAudio = async (fileId: string, regions: Region[]) => {
+  const { data } = await api.post("/remove-ranges", { fileId, regions });
+  return data as { fileId: string; path: string };
+};
