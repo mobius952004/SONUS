@@ -8,10 +8,14 @@ import {
   applyFilters,
   analyzeAudio,
   convertToStandardWav,
+  detectSpeechRegions,
   exportChunks,
   exportChunksByDuration,
+  exportDatasetChunks,
   exportFullAudio,
   exportSelectedRegions,
+  measureLoudness,
+  normalizeLoudness,
   removeTimeRangesFromAudio,
   type FiltersPayload,
   type Region,
@@ -207,6 +211,114 @@ app.post("/export", async (req, res) => {
       await exportFullAudio(inputPath, outputPath);
     }
     res.json({ files: [{ path: `/media/exports/${exportId}.${format}`, label: `Export ${format.toUpperCase()}` }] });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/** P0: LUFS Loudness Normalization */
+app.post("/normalize", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const { targetLufs, truePeakLimit } = req.body as {
+      targetLufs?: number;
+      truePeakLimit?: number;
+    };
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const safeLufs = Number.isFinite(targetLufs) ? targetLufs! : -16;
+    const safePeak = Number.isFinite(truePeakLimit) ? truePeakLimit! : -1;
+    const outputId = randomUUID();
+    const outputPath = sourcePathFor(outputId);
+    await normalizeLoudness(inputPath, outputPath, safeLufs, safePeak);
+    res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/** P0: Measure current loudness (LUFS) without changing the file */
+app.post("/measure-loudness", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const result = await measureLoudness(inputPath);
+    res.json(result);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/** P0: VAD auto-segmentation — detect speech regions */
+app.post("/detect-regions", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const { silenceThresholdDb, minSilenceDurationSec, minSpeechDurationSec } = req.body as {
+      silenceThresholdDb?: number;
+      minSilenceDurationSec?: number;
+      minSpeechDurationSec?: number;
+    };
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const regions = await detectSpeechRegions(
+      inputPath,
+      Number.isFinite(silenceThresholdDb) ? silenceThresholdDb : undefined,
+      Number.isFinite(minSilenceDurationSec) ? minSilenceDurationSec : undefined,
+      Number.isFinite(minSpeechDurationSec) ? minSpeechDurationSec : undefined,
+    );
+    res.json({ regions });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/** P0: Dataset export — chunks + manifest.json */
+app.post("/export-dataset", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const { regions, format, label, speakerId, targetLufs } = req.body as {
+      regions: Region[];
+      format: "wav" | "mp3";
+      label?: string;
+      speakerId?: string;
+      targetLufs?: number | null;
+    };
+    if (format !== "wav" && format !== "mp3") {
+      res.status(400).json({ message: "Invalid export format." });
+      return;
+    }
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const safeRegions = Array.isArray(regions) ? regions : [];
+    if (safeRegions.length === 0) {
+      res.status(400).json({ message: "Dataset export needs at least one region." });
+      return;
+    }
+    const exportId = randomUUID();
+    const outDir = path.join(exportsDir, exportId);
+    const safeLabel = typeof label === "string" ? label : "";
+    const safeSpeakerId = typeof speakerId === "string" ? speakerId : "";
+    const safeLufs = targetLufs !== null && Number.isFinite(targetLufs) ? targetLufs! : null;
+
+    const { manifest } = await exportDatasetChunks(
+      inputPath, outDir, exportId, format, safeRegions,
+      safeLabel, safeSpeakerId, safeLufs,
+    );
+
+    const files = manifest.map((item) => ({
+      path: `/media/exports/${exportId}/${item.filename}`,
+      label: `Chunk ${item.index}`,
+    }));
+    files.push({
+      path: `/media/exports/${exportId}/manifest.json`,
+      label: "manifest.json",
+    });
+    res.json({
+      files,
+      manifest,
+      manifestUrl: `/media/exports/${exportId}/manifest.json`,
+    });
   } catch (error) {
     sendError(res, error);
   }

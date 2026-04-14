@@ -1,89 +1,124 @@
-# Audio Signal Editor
+# SONUS — Audio Signal Editor
 
-Production-ready full-stack audio editing app focused on waveform visualization and non-destructive region editing.
+Production-ready audio editing tool for waveform visualization, non-destructive region editing, and **ML dataset preparation** for AI and human voice classification.
 
-## Stack
+## What is SONUS?
 
-- Frontend: React + Vite + TypeScript + TailwindCSS + Zustand + WaveSurfer.js (regions + timeline)
-- Backend: Node.js + Express + TypeScript
-- Audio engine: FFmpeg (via `ffmpeg-static`)
-- Storage: local filesystem (`backend/storage`)
+SONUS is a full-stack web application designed for:
+
+- **Audio cleanup** — noise reduction, silence trimming, EQ filtering, loudness normalization
+- **Dataset creation** — chunking long audio into labeled segments for ML training
+- **AI vs Human voice dataset preparation** — label, normalize, and export structured datasets with manifest metadata
+- **Batch processing** — analyze, clean, and export hundreds of files in one workflow
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React 19 · Vite · TypeScript · TailwindCSS 4 · Zustand · WaveSurfer.js |
+| Backend | Node.js · Express 5 · TypeScript |
+| Audio engine | FFmpeg (bundled via `ffmpeg-static`, no global install needed) |
+| Storage | Local filesystem (`backend/storage/`) |
+
+---
 
 ## Features
 
-- Upload and validate `.mp3`, `.wav`, `.amr`, `.m4a`, `.aac`, `.ogg`, `.webm` up to 50MB
-- Internal standardization to WAV (`16kHz`, mono)
-- Interactive waveform:
-  - Play/pause
-  - Seek
-  - Zoom
-  - Time axis
-- Multiple editable ranges (regions)
-  - Add/remove
-  - Drag/resize
-  - Editable start/end inputs
-  - Overlap prevention with modal alert and revert
-- Undo/redo for region and filter state changes
-- Playback speed control (`0.5x` to `4x`)
-- Filters (FFmpeg-backed):
-  - High-pass / low-pass
-  - Echo (`aecho`)
-  - Noise reduction (`afftdn`)
-  - Silence trimming (`silenceremove`)
-- Audio analyzer:
-  - Duration, sample rate, channels, bitrate
-  - Mean/max volume and clipping risk
-  - Silence segment detection
-  - One-click recommended cleanup settings
-- Export:
-  - Full audio
-  - Selected regions (concatenated)
-  - Split chunks
-  - Formats: `.wav`, `.mp3`
-- Batch dataset workflow:
-  - Multi-file upload queue
-  - Analyze all files
-  - Auto-clean all files using analyzer recommendations
-  - Export all files in selected format
+### Core Audio Editing
+- Upload `.mp3`, `.wav`, `.amr`, `.m4a`, `.aac`, `.ogg`, `.webm` (up to 50MB)
+- Internal standardization to WAV (16kHz, mono)
+- Interactive waveform with play/pause, seek, zoom, and timeline
+- Spectrogram view for noise/hum/artifact inspection
+- 1D signal oscilloscope visualization
+- Playback speed control (0.5x–4x)
+- Keyboard shortcut: `Space` to play/pause
 
-## Project Structure
+### Region Editing
+- Add, remove, drag, resize regions on the waveform
+- Draw regions directly on waveform (toggle mode)
+- Editable start/end time inputs per region
+- Overlap prevention with validation
+- Crop to selected regions or remove selected regions
+- Undo/redo for all region and filter changes (50-level history)
 
-```txt
-frontend/   # React app
-backend/    # Express + FFmpeg APIs
-```
+### Filters (FFmpeg-backed)
+- High-pass / low-pass frequency filter
+- Echo cancellation (`aecho`)
+- Noise reduction (`afftdn`)
+- Silence trimming (`silenceremove`)
 
-## Setup
+### Audio Analysis
+- Duration, sample rate, channels, bitrate
+- Mean/max volume and clipping risk assessment
+- Silence segment detection and total silence duration
+- One-click recommended cleanup settings
 
-## Quick Start (2 minutes)
+### LUFS Loudness Normalization
+- Measure current loudness (integrated LUFS, true peak, LRA)
+- Two-pass EBU R128 normalization
+- Presets: -14 LUFS (podcast), -16 LUFS (speech), -23 LUFS (broadcast), -24 LUFS (ATSC)
+- Per-chunk normalization during dataset export
 
-```bash
-# Terminal 1
-cd backend
-npm install
-npm run generate:sample
-npm run dev
+### VAD Auto-Segmentation
+- One-click voice activity detection
+- Automatically creates regions for all speech segments
+- Configurable silence threshold, minimum gap, and minimum segment length
+- Replaces hours of manual chunking
 
-# Terminal 2
-cd frontend
-npm install
-npm run dev
-```
+### Export
+- Full audio, selected regions (concatenated), or split chunks
+- Formats: `.wav`, `.mp3`
+- Auto-download with fallback download list
 
-Open `http://localhost:5173`, upload an audio file, then use **Analyze Audio** -> **Apply Recommended Cleanup Settings** -> **Apply Filters** -> **Export Audio**.
+### Dataset Export
+- Export checked regions as individually labeled chunks
+- Labels: `human`, `ai`, or `unlabeled`
+- Custom speaker ID per export
+- Optional per-chunk LUFS normalization
+- Generates `manifest.json` with full metadata per chunk
+- Compatible with standard ML dataset pipelines
+
+### Batch Processing
+- Multi-file upload queue
+- Analyze all, auto-clean all, export all
+- Per-file status tracking and download links
+
+### Session Management
+- Persistent editor state across browser refreshes
+- Validates saved state on reload (clears if backend files expired)
+- Clear session button to reset everything
+- A/B comparison between original and processed audio
+
+---
 
 ## System Requirements
 
-- OS: Windows, macOS, or Linux
-- Node.js: `>=20.x` (LTS recommended)
-- npm: `>=10.x`
-- RAM: 8GB minimum (16GB recommended for large batch processing)
-- Disk: 2GB free minimum, more for large datasets and exports
-- Internet: required for initial `npm install`
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| OS | Windows 10+, macOS, Linux | Any modern OS |
+| Node.js | 20.x | Latest LTS |
+| npm | 10.x | Latest |
+| RAM | 8 GB | 16 GB (for large batches) |
+| Disk | 2 GB free | 10+ GB for large datasets |
+| Browser | Chrome, Edge, Firefox | Latest Chrome/Edge |
+| Internet | For initial `npm install` | — |
 
-Full dependency and environment checklist is available in `REQUIREMENTS.md`.
+> **No global FFmpeg install is needed.** The backend uses bundled binaries via `ffmpeg-static` and `ffprobe-static`.
 
-### 1) Backend
+---
+
+## Quick Start
+
+### 1. Clone the repository
+
+```bash
+git clone <your-repo-url>
+cd SONUS
+```
+
+### 2. Start the backend
 
 ```bash
 cd backend
@@ -92,9 +127,9 @@ npm run generate:sample
 npm run dev
 ```
 
-Backend runs on `http://localhost:4000`.
+Backend runs on **http://localhost:4000**
 
-### 2) Frontend
+### 3. Start the frontend (new terminal)
 
 ```bash
 cd frontend
@@ -102,61 +137,78 @@ npm install
 npm run dev
 ```
 
-Frontend runs on `http://localhost:5173`.
+Frontend runs on **http://localhost:5173**
 
-## What the current app does
+### 4. Open the app
 
-This version is built for practical audio cleanup and dataset preparation:
+Navigate to **http://localhost:5173** in your browser. Upload an audio file to begin.
 
-- Processes one audio file interactively with waveform, regions, filters, and export controls.
-- Supports A/B listening between original and processed output.
-- Analyzes uploaded audio and surfaces artifact indicators (noise level, clipping risk, silence profile).
-- Applies recommended cleanup settings automatically from analyzer output.
-- Runs a batch queue to analyze, auto-clean, and export multiple files in one flow.
-- Exports either full audio, selected region combinations, or selected regions split as chunks.
+---
 
-## How to use
+## Project Structure
 
-### Single-file workflow
+```
+SONUS/
+├── frontend/                  # React + Vite app
+│   ├── src/
+│   │   ├── App.tsx            # Main application component (all UI)
+│   │   ├── api.ts             # API client functions
+│   │   ├── types.ts           # TypeScript type definitions
+│   │   ├── main.tsx           # Entry point
+│   │   ├── index.css          # Tailwind + utility classes
+│   │   ├── store/
+│   │   │   └── editorStore.ts # Zustand state management (undo/redo)
+│   │   └── lib/
+│   │       ├── regions.ts     # Region validation utilities
+│   │       └── persistUi.ts   # LocalStorage persistence
+│   ├── index.html
+│   ├── vite.config.ts
+│   └── package.json
+│
+├── backend/                   # Express + FFmpeg API server
+│   ├── src/
+│   │   ├── index.ts           # Express server, routes, file cleanup
+│   │   └── ffmpegService.ts   # All FFmpeg operations
+│   ├── storage/               # Runtime file storage (auto-created)
+│   │   ├── uploads/           # Raw uploaded files
+│   │   ├── processed/         # Standardized/processed WAVs
+│   │   └── exports/           # Exported chunks and datasets
+│   ├── samples/               # Generated sample audio
+│   ├── scripts/
+│   │   └── generate-sample.mjs
+│   └── package.json
+│
+├── README.md                  # This file
+├── REQUIREMENTS.md            # Dependency checklist
+└── USER_MANUAL.md             # Detailed usage guide
+```
 
-1. Upload an audio file in the top-left upload control.
-2. Use the waveform to play, seek, zoom, and set playback speed.
-3. Create ranges with **Add Range**, adjust start/end in **Range Editor**, and mark which ranges to include for export.
-4. In **Filters**, configure cleanup options (high/low pass, noise reduction, silence trimming, etc.) and click **Apply Filters**.
-5. In **Audio Analyzer**, click **Analyze Audio** to inspect characteristics and optionally click **Apply Recommended Cleanup Settings**.
-6. In **Processed Output Preview**, listen to generated processed versions.
-7. In **A/B Compare**, compare original vs latest processed output.
-8. In **Export**, choose mode (`full`, `selected`, or `chunks`) and format (`.wav` / `.mp3`), then click **Export Audio**.
-
-### Batch dataset workflow
-
-1. In **Batch Dataset Pipeline**, select multiple files using the multi-file input.
-2. Click **Analyze All** to compute artifact and quality metrics for each file.
-3. Click **Auto-Clean All** to process each file using analyzer-based recommended settings.
-4. Select batch export format and click **Export All**.
-5. Download each result from the per-file export links in the batch list.
-
-### Selecting and exporting multiple chunks from one file
-
-1. Add multiple ranges in the main editor.
-2. In **Range Editor**, check **Include this range in selected/chunk export** for each range you want.
-3. In **Export**, choose:
-   - `Selected regions only` to concatenate checked ranges into one file, or
-   - `Split into chunks` to export each checked range as a separate chunk file.
-4. Click **Export Audio** and download from generated links.
+---
 
 ## API Endpoints
 
-- `POST /upload` - upload and standardize audio
-- `POST /process` - apply filters on current standardized file
-- `POST /analyze` - inspect audio quality/artifacts and recommendations
-- `POST /export` - export full/selected/chunks in requested format
-- `GET /media/**` - serve generated media files
-- `GET /samples/**` - serve sample files
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/upload` | Upload and standardize audio file |
+| `POST` | `/process` | Apply filters to current file |
+| `POST` | `/analyze` | Analyze audio quality and artifacts |
+| `POST` | `/export` | Export full/selected/chunks |
+| `POST` | `/normalize` | LUFS loudness normalization |
+| `POST` | `/measure-loudness` | Measure current LUFS/peak/LRA |
+| `POST` | `/detect-regions` | VAD auto-segmentation |
+| `POST` | `/export-dataset` | Export chunks + manifest.json |
+| `POST` | `/remove-ranges` | Remove time ranges from audio |
+| `POST` | `/keep-ranges` | Keep only selected ranges |
+| `GET` | `/media/**` | Serve processed/exported files |
+| `GET` | `/samples/**` | Serve sample files |
+| `GET` | `/health` | Health check |
+
+---
 
 ## Notes
 
-- Processing uses real FFmpeg commands end-to-end.
-- Exported files are written locally under `backend/storage/exports`.
-- Sample file generation uses FFmpeg and writes to `backend/samples/sample-voice.wav`.
-- For reproducible setup and dependency details, see `REQUIREMENTS.md`.
+- All audio processing uses real FFmpeg commands — no browser-side processing
+- Files in `backend/storage/` are automatically cleaned up after 1 hour
+- Session state is saved to `localStorage` and validated on reload
+- Undo/redo history is capped at 50 entries to limit memory usage
+- The download system uses `fetch` → blob → object URL to handle cross-origin downloads between the dev servers

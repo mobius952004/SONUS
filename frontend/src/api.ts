@@ -1,5 +1,5 @@
 import axios from "axios";
-import type { AudioAnalysis, ExportFormat, ExportMode, FilterConfig, Region } from "./types";
+import type { AudioAnalysis, DatasetChunkMeta, DetectedRegion, ExportFormat, ExportMode, FilterConfig, LoudnessMeasurement, Region } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4000";
 
@@ -56,4 +56,56 @@ export const removeRangesFromAudio = async (fileId: string, regions: Region[]) =
 export const keepSelectedRanges = async (fileId: string, regions: Region[]) => {
   const { data } = await api.post("/keep-ranges", { fileId, regions });
   return data as { fileId: string; path: string };
+};
+
+/** P0: Normalize audio to target LUFS loudness */
+export const normalizeAudio = async (fileId: string, targetLufs: number, truePeakLimit: number = -1) => {
+  const { data } = await api.post("/normalize", { fileId, targetLufs, truePeakLimit });
+  return data as { fileId: string; path: string };
+};
+
+/** P0: Measure current loudness (LUFS) */
+export const measureAudioLoudness = async (fileId: string) => {
+  const { data } = await api.post("/measure-loudness", { fileId });
+  return data as LoudnessMeasurement;
+};
+
+/** P0: Auto-detect speech regions via VAD */
+export const detectRegions = async (
+  fileId: string,
+  silenceThresholdDb?: number,
+  minSilenceDurationSec?: number,
+  minSpeechDurationSec?: number,
+) => {
+  const { data } = await api.post("/detect-regions", {
+    fileId,
+    silenceThresholdDb,
+    minSilenceDurationSec,
+    minSpeechDurationSec,
+  });
+  return data as { regions: DetectedRegion[] };
+};
+
+/** P0: Export dataset with chunks + manifest.json */
+export const exportDataset = async (
+  fileId: string,
+  regions: Region[],
+  format: ExportFormat,
+  label: string,
+  speakerId: string,
+  targetLufs: number | null,
+) => {
+  const { data } = await api.post("/export-dataset", {
+    fileId,
+    regions,
+    format,
+    label,
+    speakerId,
+    targetLufs,
+  });
+  return data as {
+    files: Array<{ path: string; label: string }>;
+    manifest: DatasetChunkMeta[];
+    manifestUrl: string;
+  };
 };

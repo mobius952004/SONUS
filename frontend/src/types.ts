@@ -41,3 +41,29 @@ export type AudioAnalysis = {
     trimSilenceMinDuration: number;
   };
 };
+
+export type LoudnessMeasurement = {
+  integratedLufs: number;
+  truePeakDb: number;
+  lra: number;
+};
+
+export type DetectedRegion = {
+  start: number;
+  end: number;
+  durationSec: number;
+};
+
+export type DatasetChunkMeta = {
+  filename: string;
+  path: string;
+  index: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  sampleRate: number;
+  channels: number;
+  format: string;
+  label: string;
+  speakerId: string;
+};

@@ -5,10 +5,14 @@ import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 import TimelinePlugin from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import {
   analyzeAudio,
+  detectRegions,
   exportAudio,
+  exportDataset,
   getApiErrorMessage,
   keepSelectedRanges,
+  measureAudioLoudness,
   mediaUrl,
+  normalizeAudio,
   processAudio,
   removeRangesFromAudio,
   uploadAudio,
@@ -16,7 +20,7 @@ import {
 import { hasOverlap, isValidRange, nextRegionWindow, withUpdatedRegion } from "./lib/regions";
 import { clearPersistedState, loadPersistedState, savePersistedState } from "./lib/persistUi";
 import { defaultFilters, useEditorStore } from "./store/editorStore";
-import type { AudioAnalysis, ExportFormat, ExportMode, Region } from "./types";
+import type { AudioAnalysis, DatasetChunkMeta, ExportFormat, ExportMode, LoudnessMeasurement, Region } from "./types";
 
 const ACCEPT_TYPES = ".mp3,.wav,.amr,.m4a,.aac,.ogg,.webm";
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
@@ -70,6 +74,25 @@ function App() {
   const [fileInputKey, setFileInputKey] = useState(0);
   const originalAudioRef = useRef<HTMLAudioElement | null>(null);
   const processedAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // P0: LUFS Normalization state
+  const [loudness, setLoudness] = useState<LoudnessMeasurement | null>(null);
+  const [targetLufs, setTargetLufs] = useState(-16);
+  const [truePeakLimit, setTruePeakLimit] = useState(-1);
+
+  // P0: VAD Auto-Segmentation state
+  const [vadSilenceThreshold, setVadSilenceThreshold] = useState(-35);
+  const [vadMinSilenceDuration, setVadMinSilenceDuration] = useState(0.4);
+  const [vadMinSpeechDuration, setVadMinSpeechDuration] = useState(0.3);
+
+  // P0: Dataset Export state
+  const [datasetLabel, setDatasetLabel] = useState<"ai" | "human" | "">("human");
+  const [datasetSpeakerId, setDatasetSpeakerId] = useState("");
+  const [datasetNormalize, setDatasetNormalize] = useState(true);
+  const [datasetTargetLufs, setDatasetTargetLufs] = useState(-16);
+  const [datasetExportFormat, setDatasetExportFormat] = useState<ExportFormat>("wav");
+  const [datasetExports, setDatasetExports] = useState<Array<{ path: string; label: string }>>([]);
+  const [datasetManifest, setDatasetManifest] = useState<DatasetChunkMeta[] | null>(null);
 
   const {
     fileId,
@@ -628,6 +651,89 @@ function App() {
       trimSilenceThreshold: analysis.recommended.trimSilenceThreshold,
       trimSilenceMinDuration: analysis.recommended.trimSilenceMinDuration,
     });
+  };
+
+  // --- P0: LUFS Normalization handlers ---
+  const runMeasureLoudness = async () => {
+    if (!fileId) return;
+    setBusy("Measuring loudness (LUFS)...");
+    try {
+      const result = await measureAudioLoudness(fileId);
+      setLoudness(result);
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runNormalizeLoudness = async () => {
+    if (!fileId) return;
+    setBusy(`Normalizing to ${targetLufs} LUFS...`);
+    try {
+      const result = await normalizeAudio(fileId, targetLufs, truePeakLimit);
+      updateFileId(result.fileId, mediaUrl(result.path));
+      setExports([]);
+      setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
+      setWavePreviewMode("current");
+      setLoudness(null); // re-measure after normalization
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // --- P0: VAD Auto-Segmentation handler ---
+  const runVadDetection = async () => {
+    if (!fileId) return;
+    setBusy("Detecting speech regions (VAD)...");
+    try {
+      const result = await detectRegions(fileId, vadSilenceThreshold, vadMinSilenceDuration, vadMinSpeechDuration);
+      if (result.regions.length === 0) {
+        setErrorModal("No speech regions detected. Try lowering the silence threshold or minimum duration.");
+        return;
+      }
+      // Create editor regions from detected speech segments
+      const newRegions: Region[] = result.regions.map((r) => ({
+        id: crypto.randomUUID(),
+        start: Math.round(r.start * 100) / 100,
+        end: Math.round(r.end * 100) / 100,
+      }));
+      commitRegions(newRegions);
+      setSelectedExportRegionIds(newRegions.map((r) => r.id));
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // --- P0: Dataset Export handler ---
+  const runDatasetExport = async () => {
+    if (!fileId) return;
+    const chosenRegions = regions.filter((r) => selectedExportRegionIds.includes(r.id));
+    if (chosenRegions.length === 0) {
+      setErrorModal("Dataset export needs at least one checked region. Use VAD detection or add regions manually.");
+      return;
+    }
+    setBusy(`Exporting dataset (${chosenRegions.length} chunks)...`);
+    try {
+      const result = await exportDataset(
+        fileId,
+        chosenRegions,
+        datasetExportFormat,
+        datasetLabel,
+        datasetSpeakerId,
+        datasetNormalize ? datasetTargetLufs : null,
+      );
+      setDatasetExports(result.files);
+      setDatasetManifest(result.manifest);
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
   };
 
   const onBatchUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1328,6 +1434,155 @@ function App() {
                   ))
                 )}
               </div>
+            </div>
+          </div>
+
+          <div className="panel">
+            <h2 className="panel-title">LUFS Loudness Normalization</h2>
+            <div className="space-y-2 text-sm">
+              <button className="btn w-full" onClick={runMeasureLoudness} disabled={!fileId}>
+                Measure Current Loudness
+              </button>
+              {loudness && (
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded border p-2 text-center">
+                    <div className="text-xs text-slate-500">Integrated</div>
+                    <div className="font-medium">{loudness.integratedLufs.toFixed(1)} LUFS</div>
+                  </div>
+                  <div className="rounded border p-2 text-center">
+                    <div className="text-xs text-slate-500">True Peak</div>
+                    <div className="font-medium">{loudness.truePeakDb.toFixed(1)} dB</div>
+                  </div>
+                  <div className="rounded border p-2 text-center">
+                    <div className="text-xs text-slate-500">LRA</div>
+                    <div className="font-medium">{loudness.lra.toFixed(1)} LU</div>
+                  </div>
+                </div>
+              )}
+              <label className="block">
+                Target LUFS
+                <select className="field mt-1" value={targetLufs} onChange={(e) => setTargetLufs(Number(e.target.value))}>
+                  <option value={-14}>-14 LUFS (loud, podcast)</option>
+                  <option value={-16}>-16 LUFS (speech, recommended)</option>
+                  <option value={-23}>-23 LUFS (EBU R128 broadcast)</option>
+                  <option value={-24}>-24 LUFS (ATSC broadcast)</option>
+                </select>
+              </label>
+              <label className="block">
+                True Peak Limit (dB)
+                <input className="field mt-1" type="number" min={-10} max={0} step={0.5} value={truePeakLimit} onChange={(e) => setTruePeakLimit(Number(e.target.value))} />
+              </label>
+              <button className="btn w-full" onClick={runNormalizeLoudness} disabled={!fileId}>
+                Normalize Loudness
+              </button>
+              <p className="text-xs text-slate-500">
+                Two‑pass EBU R128 normalization. Ensures all audio chunks have consistent perceived loudness for training data.
+              </p>
+            </div>
+          </div>
+
+          <div className="panel">
+            <h2 className="panel-title">VAD Auto‑Segmentation</h2>
+            <div className="space-y-2 text-sm">
+              <p className="text-xs text-slate-500">
+                Automatically detect speech regions and create ranges. Replaces manual chunking.
+              </p>
+              <label className="block">
+                Silence threshold (dB)
+                <input className="field mt-1" type="number" min={-80} max={-10} step={1} value={vadSilenceThreshold} onChange={(e) => setVadSilenceThreshold(Number(e.target.value))} />
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="block">
+                  Min silence gap (s)
+                  <input className="field mt-1" type="number" min={0.1} max={5} step={0.1} value={vadMinSilenceDuration} onChange={(e) => setVadMinSilenceDuration(Number(e.target.value))} />
+                </label>
+                <label className="block">
+                  Min speech length (s)
+                  <input className="field mt-1" type="number" min={0.1} max={10} step={0.1} value={vadMinSpeechDuration} onChange={(e) => setVadMinSpeechDuration(Number(e.target.value))} />
+                </label>
+              </div>
+              <button className="btn w-full" onClick={runVadDetection} disabled={!fileId}>
+                Detect Speech Regions
+              </button>
+              <p className="text-xs text-slate-500">
+                Detects speech via silence gap inversion. Creates regions for all speech segments. Existing regions are replaced.
+              </p>
+            </div>
+          </div>
+
+          <div className="panel">
+            <h2 className="panel-title">Dataset Export</h2>
+            <div className="space-y-2 text-sm">
+              <p className="text-xs text-slate-500">
+                Export checked regions as individually labeled chunks with a manifest.json for ML training pipelines.
+              </p>
+              <label className="block">
+                Label
+                <select className="field mt-1" value={datasetLabel} onChange={(e) => setDatasetLabel(e.target.value as "ai" | "human" | "")}>
+                  <option value="human">human</option>
+                  <option value="ai">ai</option>
+                  <option value="">unlabeled</option>
+                </select>
+              </label>
+              <label className="block">
+                Speaker ID
+                <input className="field mt-1" type="text" placeholder="e.g. speaker_01" value={datasetSpeakerId} onChange={(e) => setDatasetSpeakerId(e.target.value)} />
+              </label>
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={datasetNormalize} onChange={(e) => setDatasetNormalize(e.target.checked)} />
+                Normalize each chunk to target LUFS
+              </label>
+              {datasetNormalize && (
+                <select className="field" value={datasetTargetLufs} onChange={(e) => setDatasetTargetLufs(Number(e.target.value))}>
+                  <option value={-14}>-14 LUFS (podcast)</option>
+                  <option value={-16}>-16 LUFS (speech)</option>
+                  <option value={-23}>-23 LUFS (broadcast)</option>
+                </select>
+              )}
+              <select className="field" value={datasetExportFormat} onChange={(e) => setDatasetExportFormat(e.target.value as ExportFormat)}>
+                <option value="wav">.wav</option>
+                <option value="mp3">.mp3</option>
+              </select>
+              <p className="text-xs text-slate-600">
+                Checked regions: {selectedExportRegionIds.length} / {regions.length}
+              </p>
+              <button className="btn w-full" onClick={runDatasetExport} disabled={!fileId || selectedExportRegionIds.length === 0}>
+                Export Dataset ({selectedExportRegionIds.length} chunks)
+              </button>
+              {datasetExports.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  <p className="text-xs font-medium text-slate-700">Dataset files ({datasetExports.length})</p>
+                  <ul className="max-h-48 space-y-1 overflow-auto text-sm">
+                    {datasetExports.map((item) => {
+                      const filename = item.path.split("/").pop() ?? "file";
+                      return (
+                        <li key={item.path} className="flex items-center justify-between gap-2 rounded border border-slate-200 bg-white px-2 py-1">
+                          <span className="min-w-0 flex-1 truncate text-xs text-slate-700">{item.label}</span>
+                          <button
+                            type="button"
+                            className="shrink-0 rounded border border-slate-300 bg-slate-50 px-2 py-0.5 text-xs hover:bg-slate-100"
+                            onClick={() => downloadViaBlob(mediaUrl(item.path), filename)}
+                          >
+                            Download
+                          </button>
+                          <a className="shrink-0 text-xs text-blue-700 underline" href={mediaUrl(item.path)} target="_blank" rel="noreferrer">Open</a>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+              {datasetManifest && (
+                <div className="mt-2 rounded border border-slate-200 bg-slate-50 p-2">
+                  <p className="mb-1 text-xs font-medium text-slate-700">Manifest Summary</p>
+                  <div className="grid grid-cols-2 gap-1 text-xs text-slate-600">
+                    <div>Chunks: {datasetManifest.length}</div>
+                    <div>Total: {datasetManifest.reduce((a, c) => a + c.durationSec, 0).toFixed(1)}s</div>
+                    <div>Label: {datasetManifest[0]?.label || "—"}</div>
+                    <div>Speaker: {datasetManifest[0]?.speakerId || "—"}</div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </section>

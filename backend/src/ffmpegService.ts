@@ -346,3 +346,237 @@ export const analyzeAudio = async (inputPath: string) => {
     recommended,
   };
 };
+
+/* ------------------------------------------------------------------ */
+/*  P0 Feature 1: LUFS Loudness Normalization (EBU R128 / loudnorm)   */
+/* ------------------------------------------------------------------ */
+
+export const measureLoudness = async (inputPath: string): Promise<{ integratedLufs: number; truePeakDb: number; lra: number }> => {
+  const result = await runTool(ffmpegBinary, [
+    "-i", inputPath,
+    "-af", "loudnorm=print_format=json",
+    "-f", "null", "-",
+  ]);
+  // loudnorm prints JSON to stderr
+  const jsonMatch = result.stderr.match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
+  if (!jsonMatch) throw new Error("Failed to measure loudness.");
+  let parsed: { input_i?: string; input_tp?: string; input_lra?: string };
+  try {
+    parsed = JSON.parse(jsonMatch[0]) as typeof parsed;
+  } catch {
+    throw new Error("Invalid loudness measurement data.");
+  }
+  return {
+    integratedLufs: Number(parsed.input_i ?? -24),
+    truePeakDb: Number(parsed.input_tp ?? -1),
+    lra: Number(parsed.input_lra ?? 7),
+  };
+};
+
+export const normalizeLoudness = async (
+  inputPath: string,
+  outputPath: string,
+  targetLufs: number,
+  truePeakLimit: number = -1.0,
+): Promise<void> => {
+  await ensureDir(path.dirname(outputPath));
+  const safeLufs = Math.max(-70, Math.min(-5, targetLufs));
+  const safePeak = Math.max(-10, Math.min(0, truePeakLimit));
+
+  // Two-pass loudnorm: first measure, then normalize with precise values
+  const measurement = await measureLoudness(inputPath);
+  await runFfmpeg([
+    "-i", inputPath,
+    "-af", `loudnorm=I=${safeLufs}:TP=${safePeak}:LRA=11:measured_I=${measurement.integratedLufs}:measured_TP=${measurement.truePeakDb}:measured_LRA=${measurement.lra}:linear=true`,
+    "-ar", "16000",
+    "-ac", "1",
+    outputPath,
+  ]);
+};
+
+/* ------------------------------------------------------------------ */
+/*  P0 Feature 2: VAD Auto-Segmentation (silencedetect inversion)     */
+/* ------------------------------------------------------------------ */
+
+export type DetectedRegion = {
+  start: number;
+  end: number;
+  durationSec: number;
+};
+
+export const detectSpeechRegions = async (
+  inputPath: string,
+  silenceThresholdDb: number = -35,
+  minSilenceDurationSec: number = 0.4,
+  minSpeechDurationSec: number = 0.3,
+): Promise<DetectedRegion[]> => {
+  const durationSec = await getMediaDurationSec(inputPath);
+  const safeThreshold = Math.max(-80, Math.min(-10, silenceThresholdDb));
+  const safeSilDur = Math.max(0.1, Math.min(5, minSilenceDurationSec));
+
+  const result = await runTool(ffmpegBinary, [
+    "-i", inputPath,
+    "-af", `silencedetect=noise=${safeThreshold}dB:d=${safeSilDur}`,
+    "-f", "null", "-",
+  ]);
+
+  const silenceStarts = [...result.stderr.matchAll(/silence_start:\s*([0-9.]+)/g)].map((m) => Number(m[1]));
+  const silenceEnds = [...result.stderr.matchAll(/silence_end:\s*([0-9.]+)/g)].map((m) => Number(m[1]));
+  const silenceCount = Math.min(silenceStarts.length, silenceEnds.length);
+
+  // Build silence intervals
+  const silenceIntervals: { start: number; end: number }[] = [];
+  for (let i = 0; i < silenceCount; i++) {
+    silenceIntervals.push({ start: silenceStarts[i], end: silenceEnds[i] });
+  }
+  // Handle if file starts/ends with silence that silencedetect reports as end before start
+  // (silencedetect can emit silence_end before the first silence_start if audio starts with silence)
+  if (silenceEnds.length > silenceStarts.length) {
+    // Audio started with silence; first silence_end has no matching start
+    silenceIntervals.unshift({ start: 0, end: silenceEnds[0] });
+  }
+
+  // Invert silence intervals to get speech intervals
+  const speechRegions: DetectedRegion[] = [];
+  let cursor = 0;
+
+  // Sort silence intervals
+  silenceIntervals.sort((a, b) => a.start - b.start);
+
+  for (const si of silenceIntervals) {
+    if (si.start > cursor) {
+      const dur = si.start - cursor;
+      if (dur >= minSpeechDurationSec) {
+        speechRegions.push({ start: cursor, end: si.start, durationSec: dur });
+      }
+    }
+    cursor = Math.max(cursor, si.end);
+  }
+  // Trailing speech after last silence
+  if (cursor < durationSec) {
+    const dur = durationSec - cursor;
+    if (dur >= minSpeechDurationSec) {
+      speechRegions.push({ start: cursor, end: durationSec, durationSec: dur });
+    }
+  }
+
+  // If no silence detected at all, entire file is one speech region
+  if (silenceIntervals.length === 0 && durationSec > 0) {
+    speechRegions.push({ start: 0, end: durationSec, durationSec });
+  }
+
+  return speechRegions;
+};
+
+/* ------------------------------------------------------------------ */
+/*  P0 Feature 3: Dataset Export (chunks + manifest.json)             */
+/* ------------------------------------------------------------------ */
+
+export type DatasetChunkMeta = {
+  filename: string;
+  path: string;
+  index: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  sampleRate: number;
+  channels: number;
+  format: string;
+  label: string;
+  speakerId: string;
+};
+
+export const exportDatasetChunks = async (
+  inputPath: string,
+  outputDir: string,
+  baseName: string,
+  ext: "wav" | "mp3",
+  regions: Region[],
+  label: string,
+  speakerId: string,
+  targetLufs: number | null,
+): Promise<{ manifest: DatasetChunkMeta[]; manifestPath: string }> => {
+  await ensureDir(outputDir);
+  const durationSec = await getMediaDurationSec(inputPath);
+  const validRegions = regions
+    .map((r) => normalizeRegion(r, durationSec))
+    .filter((x): x is { start: number; end: number } => x !== null)
+    .sort((a, b) => a.start - b.start);
+  if (!validRegions.length) throw new Error("No valid regions for dataset export.");
+
+  const manifest: DatasetChunkMeta[] = [];
+
+  for (let i = 0; i < validRegions.length; i += 1) {
+    const region = validRegions[i];
+    const chunkFilename = `${baseName}-chunk-${i + 1}.${ext}`;
+    const outputPath = path.join(outputDir, chunkFilename);
+
+    if (targetLufs !== null) {
+      // Export chunk then normalize
+      const tmpPath = path.join(outputDir, `_tmp_chunk_${i + 1}.wav`);
+      await runFfmpeg([
+        "-ss", `${region.start}`,
+        "-i", inputPath,
+        "-t", `${region.end - region.start}`,
+        tmpPath,
+      ]);
+      await normalizeLoudness(tmpPath, outputPath, targetLufs);
+      await fs.unlink(tmpPath).catch(() => undefined);
+    } else {
+      await runFfmpeg([
+        "-ss", `${region.start}`,
+        "-i", inputPath,
+        "-t", `${region.end - region.start}`,
+        ...audioEncodeArgsForOutput(outputPath),
+        outputPath,
+      ]);
+    }
+
+    // Probe the output chunk for real metadata
+    const probe = await runTool(ffprobeBinary, [
+      "-v", "error", "-show_streams", "-show_format", "-of", "json", outputPath,
+    ]);
+    let probedRate = 16000;
+    let probedChannels = 1;
+    let probedDuration = region.end - region.start;
+    if (probe.code === 0) {
+      try {
+        const pj = JSON.parse(probe.stdout) as {
+          streams?: Array<{ sample_rate?: string; channels?: number }>;
+          format?: { duration?: string };
+        };
+        const as = pj.streams?.find((s: any) => true);
+        probedRate = Number(as?.sample_rate ?? probedRate);
+        probedChannels = Number(as?.channels ?? probedChannels);
+        probedDuration = Number(pj.format?.duration ?? probedDuration);
+      } catch { /* use defaults */ }
+    }
+
+    manifest.push({
+      filename: chunkFilename,
+      path: chunkFilename,
+      index: i + 1,
+      startSec: region.start,
+      endSec: region.end,
+      durationSec: probedDuration,
+      sampleRate: probedRate,
+      channels: probedChannels,
+      format: ext,
+      label,
+      speakerId,
+    });
+  }
+
+  const manifestPath = path.join(outputDir, "manifest.json");
+  await fs.writeFile(manifestPath, JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    totalChunks: manifest.length,
+    totalDurationSec: manifest.reduce((acc, c) => acc + c.durationSec, 0),
+    label,
+    speakerId,
+    normalizedLufs: targetLufs,
+    chunks: manifest,
+  }, null, 2));
+
+  return { manifest, manifestPath };
+};
