@@ -7,6 +7,16 @@ export const api = axios.create({
   baseURL: API_BASE,
 });
 
+/** Prefer server message from JSON body (e.g. FFmpeg errors); avoids generic axios status text. */
+export const getApiErrorMessage = (error: unknown) => {
+  if (axios.isAxiosError(error)) {
+    const body = error.response?.data as { message?: string } | undefined;
+    if (typeof body?.message === "string" && body.message) return body.message;
+  }
+  if (error instanceof Error && error.message) return error.message;
+  return "Request failed.";
+};
+
 export const mediaUrl = (relativePath: string) => `${API_BASE}${relativePath}`;
 
 export const uploadAudio = async (file: File) => {
@@ -39,5 +49,11 @@ export const analyzeAudio = async (fileId: string) => {
 
 export const removeRangesFromAudio = async (fileId: string, regions: Region[]) => {
   const { data } = await api.post("/remove-ranges", { fileId, regions });
+  return data as { fileId: string; path: string };
+};
+
+/** Keep only the given ranges (concatenated); replaces current file like other process operations. */
+export const keepSelectedRanges = async (fileId: string, regions: Region[]) => {
+  const { data } = await api.post("/keep-ranges", { fileId, regions });
   return data as { fileId: string; path: string };
 };

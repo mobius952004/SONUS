@@ -3,9 +3,19 @@ import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 import TimelinePlugin from "wavesurfer.js/dist/plugins/timeline.esm.js";
-import { analyzeAudio, exportAudio, mediaUrl, processAudio, removeRangesFromAudio, uploadAudio } from "./api";
+import {
+  analyzeAudio,
+  exportAudio,
+  getApiErrorMessage,
+  keepSelectedRanges,
+  mediaUrl,
+  processAudio,
+  removeRangesFromAudio,
+  uploadAudio,
+} from "./api";
 import { hasOverlap, isValidRange, nextRegionWindow, withUpdatedRegion } from "./lib/regions";
-import { useEditorStore } from "./store/editorStore";
+import { clearPersistedState, loadPersistedState, savePersistedState } from "./lib/persistUi";
+import { defaultFilters, useEditorStore } from "./store/editorStore";
 import type { AudioAnalysis, ExportFormat, ExportMode, Region } from "./types";
 
 const ACCEPT_TYPES = ".mp3,.wav,.amr,.m4a,.aac,.ogg,.webm";
@@ -29,9 +39,15 @@ function App() {
   const signalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
   const regionsPluginRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
+  const spectrogramPluginRef = useRef<ReturnType<typeof SpectrogramPlugin.create> | null>(null);
+  const dragSelectCleanupRef = useRef<(() => void) | null>(null);
+  const hydratedRef = useRef(false);
   const lastUiTickRef = useRef(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showSpectrogram, setShowSpectrogram] = useState(false);
+  /** When true, user can drag on the waveform to create new ranges (resize/drag existing regions always works). */
+  const [waveformDrawEnabled, setWaveformDrawEnabled] = useState(false);
+  const [lastUploadedFileName, setLastUploadedFileName] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [zoom, setZoom] = useState(50);
@@ -51,6 +67,7 @@ function App() {
   const [selectedExportRegionIds, setSelectedExportRegionIds] = useState<string[]>([]);
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [batchExportFormat, setBatchExportFormat] = useState<ExportFormat>("wav");
+  const [fileInputKey, setFileInputKey] = useState(0);
   const originalAudioRef = useRef<HTMLAudioElement | null>(null);
   const processedAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -62,6 +79,7 @@ function App() {
     regions,
     filters,
     setAudioFile,
+    updateFileId,
     setSelectedRegion,
     setPlaybackRate,
     commitRegions,
@@ -69,6 +87,88 @@ function App() {
     undo,
     redo,
   } = useEditorStore();
+
+  useEffect(() => {
+    if (hydratedRef.current) return;
+    hydratedRef.current = true;
+    const saved = loadPersistedState();
+    if (!saved?.fileId || !saved.sourceUrl) return;
+    // Validate the persisted file still exists on the server before restoring
+    fetch(saved.sourceUrl, { method: "HEAD" })
+      .then((res) => {
+        if (!res.ok) {
+          clearPersistedState();
+          return;
+        }
+        useEditorStore.setState({
+          fileId: saved.fileId,
+          sourceUrl: saved.sourceUrl,
+          regions: saved.regions ?? [],
+          filters: { ...defaultFilters, ...saved.filters },
+          playbackRate: saved.playbackRate ?? 1,
+          selectedRegionId: null,
+          past: [],
+          future: [],
+        });
+        setWavePreviewMode(saved.wavePreviewMode ?? "current");
+        setProcessedPreviews(saved.processedPreviews ?? []);
+        setOriginalPreview(saved.originalPreview ?? null);
+        setAnalysis(saved.analysis ?? null);
+        setSelectedExportRegionIds(saved.selectedExportRegionIds ?? []);
+        setZoom(saved.zoom ?? 50);
+        setExportMode(saved.exportMode ?? "full");
+        setExportFormat(saved.exportFormat ?? "wav");
+        setChunkSplitMode(saved.chunkSplitMode ?? "selectedRanges");
+        setFixedChunkDurationSec(saved.fixedChunkDurationSec ?? 30);
+        setLastUploadedFileName(saved.lastUploadedFileName ?? null);
+      })
+      .catch(() => {
+        clearPersistedState();
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!fileId || !sourceUrl) return;
+    const id = window.setTimeout(() => {
+      savePersistedState({
+        version: 1,
+        fileId,
+        sourceUrl,
+        regions,
+        filters,
+        playbackRate,
+        wavePreviewMode,
+        processedPreviews,
+        originalPreview,
+        analysis,
+        selectedExportRegionIds,
+        zoom,
+        exportMode,
+        exportFormat,
+        chunkSplitMode,
+        fixedChunkDurationSec,
+        lastUploadedFileName,
+      });
+    }, 500);
+    return () => window.clearTimeout(id);
+  }, [
+    fileId,
+    sourceUrl,
+    regions,
+    filters,
+    playbackRate,
+    wavePreviewMode,
+    processedPreviews,
+    originalPreview,
+    analysis,
+    selectedExportRegionIds,
+    zoom,
+    exportMode,
+    exportFormat,
+    chunkSplitMode,
+    fixedChunkDurationSec,
+    lastUploadedFileName,
+  ]);
 
   const drawSignal = (timeSec: number) => {
     const ws = waveSurferRef.current as any;
@@ -115,7 +215,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (!waveformRef.current || !timelineRef.current || !spectrogramRef.current || waveSurferRef.current) return;
+    if (!waveformRef.current || !timelineRef.current || waveSurferRef.current) return;
     const regionsPlugin = RegionsPlugin.create();
     regionsPluginRef.current = regionsPlugin;
     const ws = WaveSurfer.create({
@@ -126,16 +226,7 @@ function App() {
       minPxPerSec: 50,
       height: 160,
       normalize: true,
-      plugins: [
-        regionsPlugin,
-        TimelinePlugin.create({ container: timelineRef.current }),
-        SpectrogramPlugin.create({
-          container: spectrogramRef.current,
-          labels: true,
-          splitChannels: false,
-          scale: "mel",
-        }),
-      ],
+      plugins: [regionsPlugin, TimelinePlugin.create({ container: timelineRef.current })],
     });
     waveSurferRef.current = ws;
 
@@ -177,6 +268,22 @@ function App() {
       }
       commitRegions(proposal);
     });
+    const unsubRegionCreated = regionsPlugin.on("region-created", (region: any) => {
+      const state = useEditorStore.getState();
+      if (state.regions.some((r) => r.id === region.id)) {
+        return;
+      }
+      const created: Region = { id: region.id, start: region.start, end: region.end };
+      const next = [...state.regions, created];
+      if (!isValidRange(created.start, created.end) || hasOverlap(next)) {
+        region.remove();
+        setErrorModal("Overlapping ranges are not allowed. Adjust or remove an existing range.");
+        return;
+      }
+      commitRegions(next);
+      setSelectedExportRegionIds((prev) => [...prev, created.id]);
+      setSelectedRegion(created.id);
+    });
     regionsPlugin.on("region-update", (region: any) => {
       const proposal = withUpdatedRegion(useEditorStore.getState().regions, {
         id: region.id,
@@ -192,9 +299,61 @@ function App() {
     });
 
     return () => {
+      unsubRegionCreated();
+      dragSelectCleanupRef.current?.();
+      dragSelectCleanupRef.current = null;
       ws.destroy();
     };
   }, [commitRegions, setSelectedRegion]);
+
+  useEffect(() => {
+    const plugin = regionsPluginRef.current;
+    if (!plugin) return;
+    dragSelectCleanupRef.current?.();
+    dragSelectCleanupRef.current = null;
+    if (!waveformDrawEnabled) return;
+    dragSelectCleanupRef.current = plugin.enableDragSelection({
+      color: "rgba(59, 130, 246, 0.35)",
+      drag: true,
+      resize: true,
+    });
+    return () => {
+      dragSelectCleanupRef.current?.();
+      dragSelectCleanupRef.current = null;
+    };
+  }, [waveformDrawEnabled]);
+
+  useEffect(() => {
+    const ws = waveSurferRef.current;
+    const el = spectrogramRef.current;
+    if (!showSpectrogram) {
+      if (spectrogramPluginRef.current && ws) {
+        ws.unregisterPlugin(spectrogramPluginRef.current);
+        spectrogramPluginRef.current = null;
+      }
+      return;
+    }
+    if (!ws || !el) return;
+    if (spectrogramPluginRef.current) return;
+    const sp = SpectrogramPlugin.create({
+      container: el,
+      labels: true,
+      splitChannels: false,
+      scale: "mel",
+    });
+    ws.registerPlugin(sp);
+    spectrogramPluginRef.current = sp;
+    requestAnimationFrame(() => {
+      (ws as unknown as { emit?: (ev: string) => void }).emit?.("resize");
+    });
+    return () => {
+      const w = waveSurferRef.current;
+      if (w && spectrogramPluginRef.current) {
+        w.unregisterPlugin(spectrogramPluginRef.current);
+        spectrogramPluginRef.current = null;
+      }
+    };
+  }, [showSpectrogram]);
 
   const latestProcessed = processedPreviews[0] ?? null;
 
@@ -222,6 +381,16 @@ function App() {
   useEffect(() => {
     waveSurferRef.current?.setPlaybackRate(playbackRate);
   }, [playbackRate]);
+
+  useEffect(() => {
+    const ws = waveSurferRef.current;
+    if (!ws || !duration) return;
+    try {
+      ws.zoom(zoom);
+    } catch {
+      /* no decoded data yet */
+    }
+  }, [zoom, duration, activeWaveUrl]);
 
   useEffect(() => {
     const plugin = regionsPluginRef.current;
@@ -254,11 +423,15 @@ function App() {
     [regions, selectedRegionId],
   );
 
+  const checkedRegionsForEdit = useMemo(
+    () => regions.filter((region) => selectedExportRegionIds.includes(region.id)),
+    [regions, selectedExportRegionIds],
+  );
+
   useEffect(() => {
     setSelectedExportRegionIds((prev) => {
-      const valid = prev.filter((id) => regions.some((r) => r.id === id));
-      const missing = regions.filter((r) => !valid.includes(r.id)).map((r) => r.id);
-      return [...valid, ...missing];
+      // Only remove IDs for regions that no longer exist; don't auto-add new ones
+      return prev.filter((id) => regions.some((r) => r.id === id));
     });
   }, [regions]);
 
@@ -278,8 +451,9 @@ function App() {
       setExports([]);
       setProcessedPreviews([]);
       setAnalysis(null);
+      setLastUploadedFileName(file.name);
     } catch (error) {
-      setErrorModal((error as Error).message || "Upload failed. Check backend connection.");
+      setErrorModal(getApiErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -319,42 +493,87 @@ function App() {
     setBusy("Applying filters...");
     try {
       const result = await processAudio(fileId, filters);
-      setAudioFile(result.fileId, mediaUrl(result.path));
+      updateFileId(result.fileId, mediaUrl(result.path));
       setExports([]);
       setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
       setWavePreviewMode("current");
     } catch (error) {
-      setErrorModal((error as Error).message || "Filter processing failed.");
+      setErrorModal(getApiErrorMessage(error));
     } finally {
       setBusy(null);
     }
   };
 
-  const cutSelectedRangeFromAudio = async () => {
-    if (!fileId || !selectedRegion) return;
-    setBusy("Removing selected range from audio...");
+  const removeCheckedRangesFromAudio = async () => {
+    if (!fileId || checkedRegionsForEdit.length === 0) return;
+    setBusy("Removing checked ranges from audio...");
     try {
-      const result = await removeRangesFromAudio(fileId, [selectedRegion]);
-      setAudioFile(result.fileId, mediaUrl(result.path));
+      const result = await removeRangesFromAudio(fileId, checkedRegionsForEdit);
+      updateFileId(result.fileId, mediaUrl(result.path));
       setExports([]);
       setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
       setWavePreviewMode("current");
       setAnalysis(null);
     } catch (error) {
-      setErrorModal((error as Error).message || "Could not remove range from audio.");
+      setErrorModal(getApiErrorMessage(error));
     } finally {
       setBusy(null);
     }
   };
 
+  const cropToCheckedRanges = async () => {
+    if (!fileId || checkedRegionsForEdit.length === 0) return;
+    setBusy("Cropping to checked ranges...");
+    try {
+      const result = await keepSelectedRanges(fileId, checkedRegionsForEdit);
+      updateFileId(result.fileId, mediaUrl(result.path));
+      setExports([]);
+      setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
+      setWavePreviewMode("current");
+      setAnalysis(null);
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** Download a file via fetch+blob to avoid cross-origin <a download> issues. */
+  const downloadViaBlob = async (url: string, filename: string) => {
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch {
+      // Fallback: open in new tab if blob download fails
+      window.open(url, "_blank");
+    }
+  };
+
   const runExport = async () => {
     if (!fileId) return;
-    const previewWindow = openPreviewOnExport ? window.open("about:blank", "_blank") : null;
+    const chosenRegions =
+      exportMode === "full" ? [] : regions.filter((region) => selectedExportRegionIds.includes(region.id));
+    const useFixedDuration = exportMode === "chunks" && chunkSplitMode === "fixedDuration";
+    if (exportMode === "selected" && chosenRegions.length === 0) {
+      setErrorModal("Selected export: check at least one range in the Range Editor, or choose Full edited audio.");
+      return;
+    }
+    if (exportMode === "chunks" && !useFixedDuration && chosenRegions.length === 0) {
+      setErrorModal("Chunk export: check at least one range, or switch to Auto-split by fixed duration.");
+      return;
+    }
+    const previewWindow =
+      openPreviewOnExport && exportMode !== "chunks" ? window.open("about:blank", "_blank") : null;
     setBusy("Exporting...");
     try {
-      const chosenRegions =
-        exportMode === "full" ? [] : regions.filter((region) => selectedExportRegionIds.includes(region.id));
-      const useFixedDuration = exportMode === "chunks" && chunkSplitMode === "fixedDuration";
       const result = await exportAudio(
         fileId,
         useFixedDuration ? [] : chosenRegions,
@@ -364,28 +583,21 @@ function App() {
       );
       setExports(result.files);
 
-      if (result.files.length > 0 && previewWindow) {
+      const singleOutput = result.files.length === 1;
+      if (singleOutput && previewWindow && result.files[0]) {
         previewWindow.location.href = mediaUrl(result.files[0].path);
       } else if (previewWindow) {
         previewWindow.close();
       }
 
-      if (autoDownloadOnExport) {
-        result.files.forEach((file, index) => {
-          const link = document.createElement("a");
-          link.href = mediaUrl(file.path);
-          link.download = file.path.split("/").pop() ?? `export-${index + 1}.${exportFormat}`;
-          link.rel = "noopener";
-          document.body.appendChild(link);
-          window.setTimeout(() => {
-            link.click();
-            link.remove();
-          }, index * 120);
-        });
+      if (autoDownloadOnExport && result.files.length > 0) {
+        const first = result.files[0];
+        const filename = first.path.split("/").pop() ?? `export-1.${exportFormat}`;
+        await downloadViaBlob(mediaUrl(first.path), filename);
       }
     } catch (error) {
       if (previewWindow) previewWindow.close();
-      setErrorModal((error as Error).message || "Export failed.");
+      setErrorModal(getApiErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -398,7 +610,7 @@ function App() {
       const result = await analyzeAudio(fileId);
       setAnalysis(result);
     } catch (error) {
-      setErrorModal((error as Error).message || "Analysis failed.");
+      setErrorModal(getApiErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -454,11 +666,11 @@ function App() {
           currentFileId: "",
           currentPath: "",
           status: "error",
-          error: (error as Error).message,
+          error: getApiErrorMessage(error),
         });
       }
     }
-    setBatchItems(nextItems);
+    setBatchItems((prev) => [...prev, ...nextItems]);
     setBusy(null);
   };
 
@@ -475,7 +687,7 @@ function App() {
         const a = await analyzeAudio(item.currentFileId);
         updated.push({ ...item, analysis: a, status: "analyzed" });
       } catch (error) {
-        updated.push({ ...item, status: "error", error: (error as Error).message });
+        updated.push({ ...item, status: "error", error: getApiErrorMessage(error) });
       }
     }
     setBatchItems(updated);
@@ -494,7 +706,7 @@ function App() {
       try {
         const a = item.analysis ?? (await analyzeAudio(item.currentFileId));
         const processed = await processAudio(item.currentFileId, {
-          ...filters,
+          ...defaultFilters,
           noiseEnabled: a.recommended.noiseEnabled,
           noiseFloor: a.recommended.noiseFloor,
           passType: a.recommended.passType,
@@ -511,7 +723,7 @@ function App() {
           currentPath: processed.path,
         });
       } catch (error) {
-        updated.push({ ...item, status: "error", error: (error as Error).message });
+        updated.push({ ...item, status: "error", error: getApiErrorMessage(error) });
       }
     }
     setBatchItems(updated);
@@ -531,7 +743,7 @@ function App() {
         const out = await exportAudio(item.currentFileId, [], "full", batchExportFormat);
         updated.push({ ...item, status: "exported", lastExportPath: out.files[0]?.path });
       } catch (error) {
-        updated.push({ ...item, status: "error", error: (error as Error).message });
+        updated.push({ ...item, status: "error", error: getApiErrorMessage(error) });
       }
     }
     setBatchItems(updated);
@@ -558,9 +770,36 @@ function App() {
     processedAudioRef.current?.pause();
   };
 
+  const clearSession = () => {
+    clearPersistedState();
+    useEditorStore.setState({
+      fileId: null,
+      sourceUrl: null,
+      regions: [],
+      filters: defaultFilters,
+      selectedRegionId: null,
+      playbackRate: 1,
+      past: [],
+      future: [],
+    });
+    setProcessedPreviews([]);
+    setOriginalPreview(null);
+    setAnalysis(null);
+    setExports([]);
+    setSelectedExportRegionIds([]);
+    setBatchItems([]);
+    setWavePreviewMode("current");
+    setLastUploadedFileName(null);
+    setShowSpectrogram(false);
+    setWaveformDrawEnabled(false);
+    setZoom(50);
+    setFileInputKey((k) => k + 1);
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.code === "Space" && (event.target as HTMLElement)?.tagName !== "INPUT") {
+      const tag = (event.target as HTMLElement)?.tagName;
+      if (event.code === "Space" && tag !== "INPUT" && tag !== "TEXTAREA") {
         event.preventDefault();
         waveSurferRef.current?.playPause();
       }
@@ -577,7 +816,18 @@ function App() {
           <p className="mt-1 text-sm text-slate-600">Non-destructive editing with waveform regions and FFmpeg processing.</p>
 
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            <input type="file" accept={ACCEPT_TYPES} onChange={onUpload} className="rounded border p-2 text-sm" />
+            <input
+              key={fileInputKey}
+              type="file"
+              accept={ACCEPT_TYPES}
+              onChange={onUpload}
+              className="rounded border p-2 text-sm"
+            />
+            {lastUploadedFileName && (
+              <span className="max-w-[min(100%,12rem)] truncate text-xs text-slate-600" title={lastUploadedFileName}>
+                {lastUploadedFileName}
+              </span>
+            )}
             <button
               className="inline-flex min-w-28 items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-400"
               onClick={() => waveSurferRef.current?.playPause()}
@@ -589,22 +839,42 @@ function App() {
             <button className="btn" onClick={addRegion} disabled={!sourceUrl}>
               Add Range
             </button>
+            <button
+              type="button"
+              className={`btn ${waveformDrawEnabled ? "!bg-slate-900 !text-white" : ""}`}
+              onClick={() => setWaveformDrawEnabled((v) => !v)}
+              disabled={!sourceUrl}
+              title="When on, drag on the waveform to create a new range. Existing regions can always be dragged and resized."
+            >
+              {waveformDrawEnabled ? "Drawing ranges: on" : "Draw range on waveform"}
+            </button>
             <button className="btn" onClick={removeRegion} disabled={!selectedRegionId}>
               Remove Range
             </button>
             <button
-              className="btn !border-rose-200 !bg-rose-50 !text-rose-900 hover:!bg-rose-100"
-              onClick={cutSelectedRangeFromAudio}
-              disabled={!fileId || !selectedRegion}
-              title="FFmpeg removes the highlighted time range and loads the shorter clip as the new current file."
+              className="btn !border-emerald-200 !bg-emerald-50 !text-emerald-900 hover:!bg-emerald-100"
+              onClick={cropToCheckedRanges}
+              disabled={!fileId || checkedRegionsForEdit.length === 0}
+              title="Keep only the checked ranges (concatenated). Uses boxes in Range Editor."
             >
-              Cut selection from audio
+              Crop to checked ranges
+            </button>
+            <button
+              className="btn !border-rose-200 !bg-rose-50 !text-rose-900 hover:!bg-rose-100"
+              onClick={removeCheckedRangesFromAudio}
+              disabled={!fileId || checkedRegionsForEdit.length === 0}
+              title="Remove all checked ranges from the file. Uses boxes in Range Editor."
+            >
+              Remove checked ranges
             </button>
             <button className="btn" onClick={undo}>
               Undo
             </button>
             <button className="btn" onClick={redo}>
               Redo
+            </button>
+            <button type="button" className="btn text-xs text-slate-600" onClick={clearSession} title="Clear editor and saved browser state">
+              Clear session
             </button>
           </div>
 
@@ -613,7 +883,9 @@ function App() {
               <span>
                 {currentTime.toFixed(2)}s / {duration.toFixed(2)}s
               </span>
-              <span>Press Space to play/pause</span>
+              <span>
+                Space: play/pause · Turn on “Draw range on waveform” to paint a selection · Drag region edges to resize
+              </span>
             </div>
             <div className="mb-2 flex flex-wrap items-center gap-2">
               <span className="text-xs font-medium text-slate-600">Waveform source:</span>
@@ -650,7 +922,9 @@ function App() {
             </div>
             <div ref={waveformRef} />
             <div ref={timelineRef} className="mt-2" />
-            <div ref={spectrogramRef} className={`mt-2 overflow-x-auto rounded border ${showSpectrogram ? "block" : "hidden"}`} />
+            {showSpectrogram && (
+              <div ref={spectrogramRef} className="mt-2 overflow-x-auto rounded border border-slate-200 bg-slate-950/[0.03]" />
+            )}
             <div className="mt-3 overflow-hidden">
               <p className="mb-1 text-xs font-medium text-slate-600">1D Signal Visualization (oscilloscope)</p>
               <canvas ref={signalCanvasRef} width={1000} height={110} className="h-28 w-full rounded border border-slate-300" />
@@ -715,7 +989,7 @@ function App() {
                         );
                       }}
                     />
-                    Include this range in selected/chunk export
+                    Use for export, crop, and remove-checked
                   </label>
                   <div className="mt-1 grid grid-cols-2 gap-2">
                     <input
@@ -969,9 +1243,12 @@ function App() {
                 <input type="checkbox" checked={autoDownloadOnExport} onChange={(e) => setAutoDownloadOnExport(e.target.checked)} />
                 Auto-download all exported files/chunks
               </label>
+              <p className="text-xs text-slate-600">
+                After chunk export, every part is listed below—use Download or Open for each. Browsers often allow only one automatic download unless you allow multiple downloads for this site.
+              </p>
               <label className="flex items-center gap-2">
                 <input type="checkbox" checked={openPreviewOnExport} onChange={(e) => setOpenPreviewOnExport(e.target.checked)} />
-                Open exported audio preview in new tab
+                Open preview in new tab (single-file exports only; not used for chunks)
               </label>
               <button className="btn w-full" onClick={runExport} disabled={!fileId}>
                 Export Audio
@@ -983,15 +1260,32 @@ function App() {
               )}
             </div>
             {exports.length > 0 && (
-              <ul className="mt-3 space-y-1 text-sm">
-                {exports.map((item) => (
-                  <li key={item.path}>
-                    <a className="text-blue-700 underline" href={mediaUrl(item.path)} target="_blank" rel="noreferrer">
-                      {item.label}
-                    </a>
-                  </li>
-                ))}
-              </ul>
+              <div className="mt-3 space-y-2">
+                <p className="text-xs font-medium text-slate-700">Exported files ({exports.length})</p>
+                <ul className="space-y-2 text-sm">
+                  {exports.map((item) => {
+                    const filename = item.path.split("/").pop() ?? "export";
+                    return (
+                      <li
+                        key={item.path}
+                        className="flex flex-wrap items-center gap-2 rounded border border-slate-200 bg-white px-2 py-2"
+                      >
+                        <span className="min-w-0 flex-1 font-medium text-slate-800">{item.label}</span>
+                        <button
+                          type="button"
+                          className="inline-flex shrink-0 items-center rounded border border-slate-300 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-800 hover:bg-slate-100"
+                          onClick={() => downloadViaBlob(mediaUrl(item.path), filename)}
+                        >
+                          Download
+                        </button>
+                        <a className="text-xs text-blue-700 underline" href={mediaUrl(item.path)} target="_blank" rel="noreferrer">
+                          Open in tab
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             )}
           </div>
 

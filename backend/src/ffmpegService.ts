@@ -28,6 +28,34 @@ const ffprobeBinary = ffprobePath.path;
 
 const ensureDir = async (dirPath: string) => fs.mkdir(dirPath, { recursive: true });
 
+/** Explicit MP3 encoder avoids muxer/codec mismatches across FFmpeg builds. */
+const audioEncodeArgsForOutput = (outputPath: string): string[] =>
+  outputPath.toLowerCase().endsWith(".mp3") ? ["-c:a", "libmp3lame", "-q:a", "4"] : [];
+
+export const getMediaDurationSec = async (inputPath: string): Promise<number> => {
+  const probe = await runTool(ffprobeBinary, ["-v", "error", "-show_format", "-of", "json", inputPath]);
+  if (probe.code !== 0) throw new Error("Failed to read audio duration.");
+  let probeJson: { format?: { duration?: string } };
+  try {
+    probeJson = JSON.parse(probe.stdout) as { format?: { duration?: string } };
+  } catch {
+    throw new Error("Invalid duration metadata.");
+  }
+  const durationSec = Number(probeJson.format?.duration ?? 0);
+  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("Invalid audio duration.");
+  return durationSec;
+};
+
+const normalizeRegion = (r: Region, durationSec: number): { start: number; end: number } | null => {
+  const start = Number(r.start);
+  const end = Number(r.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  const s = Math.max(0, start);
+  const e = Math.min(durationSec, end);
+  if (!(e > s)) return null;
+  return { start: s, end: e };
+};
+
 export const runFfmpeg = (args: string[]) =>
   new Promise<void>((resolve, reject) => {
     const proc = spawn(ffmpegBinary, ["-y", ...args]);
@@ -93,19 +121,32 @@ export const applyFilters = async (inputPath: string, outputPath: string, filter
 
 export const exportFullAudio = async (inputPath: string, outputPath: string) => {
   await ensureDir(path.dirname(outputPath));
-  await runFfmpeg(["-i", inputPath, outputPath]);
+  await runFfmpeg(["-i", inputPath, ...audioEncodeArgsForOutput(outputPath), outputPath]);
 };
 
 export const exportSelectedRegions = async (inputPath: string, outputPath: string, regions: Region[]) => {
   await ensureDir(path.dirname(outputPath));
-  const validRegions = regions.filter((r) => r.start >= 0 && r.end > r.start).sort((a, b) => a.start - b.start);
-  if (!validRegions.length) throw new Error("No valid regions for selected export.");
-  const filterParts = validRegions.map(
+  const durationSec = await getMediaDurationSec(inputPath);
+  const normalized = regions
+    .map((r) => normalizeRegion(r, durationSec))
+    .filter((x): x is { start: number; end: number } => x !== null)
+    .sort((a, b) => a.start - b.start);
+  if (!normalized.length) throw new Error("No valid regions for selected export.");
+  const filterParts = normalized.map(
     (region, index) => `[0:a]atrim=start=${region.start}:end=${region.end},asetpts=PTS-STARTPTS[a${index}]`,
   );
-  const concatInputs = validRegions.map((_, index) => `[a${index}]`).join("");
-  const filterComplex = `${filterParts.join(";")};${concatInputs}concat=n=${validRegions.length}:v=0:a=1[out]`;
-  await runFfmpeg(["-i", inputPath, "-filter_complex", filterComplex, "-map", "[out]", outputPath]);
+  const concatInputs = normalized.map((_, index) => `[a${index}]`).join("");
+  const filterComplex = `${filterParts.join(";")};${concatInputs}concat=n=${normalized.length}:v=0:a=1[out]`;
+  await runFfmpeg([
+    "-i",
+    inputPath,
+    "-filter_complex",
+    filterComplex,
+    "-map",
+    "[out]",
+    ...audioEncodeArgsForOutput(outputPath),
+    outputPath,
+  ]);
 };
 
 const mergeIntervals = (intervals: { start: number; end: number }[]) => {
@@ -124,19 +165,11 @@ const mergeIntervals = (intervals: { start: number; end: number }[]) => {
 /** Removes the given time ranges from the audio and concatenates the remainder (new file, shorter duration). */
 export const removeTimeRangesFromAudio = async (inputPath: string, outputPath: string, removeRegions: Region[]) => {
   await ensureDir(path.dirname(outputPath));
-  const probe = await runTool(ffprobeBinary, ["-v", "error", "-show_format", "-of", "json", inputPath]);
-  if (probe.code !== 0) throw new Error("Failed to read audio duration for cut.");
-  const probeJson = JSON.parse(probe.stdout) as { format?: { duration?: string } };
-  const durationSec = Number(probeJson.format?.duration ?? 0);
-  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("Invalid audio duration.");
+  const durationSec = await getMediaDurationSec(inputPath);
 
   const clamped = removeRegions
-    .filter((r) => r.end > r.start)
-    .map((r) => ({
-      start: Math.max(0, r.start),
-      end: Math.min(durationSec, r.end),
-    }))
-    .filter((r) => r.end > r.start);
+    .map((r) => normalizeRegion(r, durationSec))
+    .filter((x): x is { start: number; end: number } => x !== null);
 
   const mergedRemove = mergeIntervals(clamped);
   if (!mergedRemove.length) throw new Error("No valid ranges to remove.");
@@ -160,18 +193,40 @@ export const removeTimeRangesFromAudio = async (inputPath: string, outputPath: s
   );
   const concatInputs = validKeep.map((_, index) => `[a${index}]`).join("");
   const filterComplex = `${filterParts.join(";")};${concatInputs}concat=n=${validKeep.length}:v=0:a=1[out]`;
-  await runFfmpeg(["-i", inputPath, "-filter_complex", filterComplex, "-map", "[out]", outputPath]);
+  await runFfmpeg([
+    "-i",
+    inputPath,
+    "-filter_complex",
+    filterComplex,
+    "-map",
+    "[out]",
+    ...audioEncodeArgsForOutput(outputPath),
+    outputPath,
+  ]);
 };
 
 export const exportChunks = async (inputPath: string, outputDir: string, baseName: string, ext: "wav" | "mp3", regions: Region[]) => {
   await ensureDir(outputDir);
-  const validRegions = regions.filter((r) => r.start >= 0 && r.end > r.start).sort((a, b) => a.start - b.start);
+  const durationSec = await getMediaDurationSec(inputPath);
+  const validRegions = regions
+    .map((r) => normalizeRegion(r, durationSec))
+    .filter((x): x is { start: number; end: number } => x !== null)
+    .sort((a, b) => a.start - b.start);
   if (!validRegions.length) throw new Error("No valid regions for chunk export.");
   const outputs: string[] = [];
   for (let i = 0; i < validRegions.length; i += 1) {
     const region = validRegions[i];
     const outputPath = path.join(outputDir, `${baseName}-chunk-${i + 1}.${ext}`);
-    await runFfmpeg(["-i", inputPath, "-ss", `${region.start}`, "-to", `${region.end}`, outputPath]);
+    await runFfmpeg([
+      "-ss",
+      `${region.start}`,
+      "-i",
+      inputPath,
+      "-t",
+      `${region.end - region.start}`,
+      ...audioEncodeArgsForOutput(outputPath),
+      outputPath,
+    ]);
     outputs.push(outputPath);
   }
   return outputs;
@@ -186,18 +241,23 @@ export const exportChunksByDuration = async (
 ) => {
   await ensureDir(outputDir);
   const safeChunkDuration = Math.max(1, Math.min(3600, chunkDurationSec));
-  const probe = await runTool(ffprobeBinary, ["-v", "error", "-show_format", "-of", "json", inputPath]);
-  if (probe.code !== 0) throw new Error("Failed to read audio duration for chunk export.");
-  const probeJson = JSON.parse(probe.stdout) as { format?: { duration?: string } };
-  const durationSec = Number(probeJson.format?.duration ?? 0);
-  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("Invalid audio duration.");
+  const durationSec = await getMediaDurationSec(inputPath);
 
   const outputs: string[] = [];
   let chunkIndex = 1;
   for (let start = 0; start < durationSec; start += safeChunkDuration) {
     const end = Math.min(durationSec, start + safeChunkDuration);
     const outputPath = path.join(outputDir, `${baseName}-chunk-${chunkIndex}.${ext}`);
-    await runFfmpeg(["-i", inputPath, "-ss", `${start}`, "-to", `${end}`, outputPath]);
+    await runFfmpeg([
+      "-ss",
+      `${start}`,
+      "-i",
+      inputPath,
+      "-t",
+      `${end - start}`,
+      ...audioEncodeArgsForOutput(outputPath),
+      outputPath,
+    ]);
     outputs.push(outputPath);
     chunkIndex += 1;
   }
@@ -220,10 +280,15 @@ export const analyzeAudio = async (inputPath: string) => {
     inputPath,
   ]);
   if (probe.code !== 0) throw new Error("Failed to analyze audio metadata.");
-  const probeJson = JSON.parse(probe.stdout) as {
+  let probeJson: {
     streams?: Array<{ codec_type?: string; sample_rate?: string; channels?: number; bit_rate?: string }>;
     format?: { duration?: string; bit_rate?: string };
   };
+  try {
+    probeJson = JSON.parse(probe.stdout) as typeof probeJson;
+  } catch {
+    throw new Error("Invalid analysis metadata.");
+  }
   const audioStream = probeJson.streams?.find((s) => s.codec_type === "audio");
   const durationSec = Number(probeJson.format?.duration ?? 0);
   const sampleRate = Number(audioStream?.sample_rate ?? 0);

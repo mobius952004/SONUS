@@ -49,6 +49,26 @@ app.use("/samples", express.static(samplesDir));
 
 const sourcePathFor = (fileId: string) => path.join(processedDir, `${fileId}.wav`);
 
+/** Reject path traversal / arbitrary filenames (fileId must be a UUID from this app). */
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const readBodyFileId = (body: unknown): string => {
+  if (typeof body !== "object" || body === null || !("fileId" in body)) {
+    throw Object.assign(new Error("Missing file id."), { statusCode: 400 });
+  }
+  const id = (body as { fileId: unknown }).fileId;
+  if (typeof id !== "string" || !UUID_V4_RE.test(id)) {
+    throw Object.assign(new Error("Invalid file id."), { statusCode: 400 });
+  }
+  return id;
+};
+
+const sendError = (res: express.Response, error: unknown) => {
+  const err = error as Error & { statusCode?: number };
+  const status = typeof err.statusCode === "number" ? err.statusCode : 500;
+  res.status(status).json({ message: err.message || "Request failed." });
+};
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/upload", upload.single("audio"), async (req, res) => {
@@ -68,13 +88,14 @@ app.post("/upload", upload.single("audio"), async (req, res) => {
     await fs.unlink(req.file.path).catch(() => undefined);
     res.json({ fileId, path: `/media/processed/${fileId}.wav` });
   } catch (error) {
-    res.status(500).json({ message: (error as Error).message });
+    sendError(res, error);
   }
 });
 
 app.post("/process", async (req, res) => {
   try {
-    const { fileId, filters } = req.body as { fileId: string; filters: FiltersPayload };
+    const fileId = readBodyFileId(req.body);
+    const { filters } = req.body as { filters: FiltersPayload };
     const inputPath = sourcePathFor(fileId);
     await fs.access(inputPath);
     const outputId = randomUUID();
@@ -82,25 +103,26 @@ app.post("/process", async (req, res) => {
     await applyFilters(inputPath, outputPath, filters);
     res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
   } catch (error) {
-    res.status(500).json({ message: (error as Error).message });
+    sendError(res, error);
   }
 });
 
 app.post("/analyze", async (req, res) => {
   try {
-    const { fileId } = req.body as { fileId: string };
+    const fileId = readBodyFileId(req.body);
     const inputPath = sourcePathFor(fileId);
     await fs.access(inputPath);
     const analysis = await analyzeAudio(inputPath);
     res.json(analysis);
   } catch (error) {
-    res.status(500).json({ message: (error as Error).message });
+    sendError(res, error);
   }
 });
 
 app.post("/remove-ranges", async (req, res) => {
   try {
-    const { fileId, regions } = req.body as { fileId: string; regions: Region[] };
+    const fileId = readBodyFileId(req.body);
+    const { regions } = req.body as { regions: Region[] };
     const inputPath = sourcePathFor(fileId);
     await fs.access(inputPath);
     const safeRegions = Array.isArray(regions) ? regions : [];
@@ -109,30 +131,63 @@ app.post("/remove-ranges", async (req, res) => {
     await removeTimeRangesFromAudio(inputPath, outputPath, safeRegions);
     res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
   } catch (error) {
-    res.status(500).json({ message: (error as Error).message });
+    sendError(res, error);
+  }
+});
+
+/** Concatenate selected time ranges into a new processed clip (crop / keep only). */
+app.post("/keep-ranges", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const { regions } = req.body as { regions: Region[] };
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const safeRegions = Array.isArray(regions) ? regions : [];
+    if (safeRegions.length === 0) {
+      res.status(400).json({ message: "No regions provided." });
+      return;
+    }
+    const outputId = randomUUID();
+    const outputPath = sourcePathFor(outputId);
+    await exportSelectedRegions(inputPath, outputPath, safeRegions);
+    res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
+  } catch (error) {
+    sendError(res, error);
   }
 });
 
 app.post("/export", async (req, res) => {
   try {
-    const { fileId, regions, mode, format, chunkDurationSec } = req.body as {
-      fileId: string;
+    const fileId = readBodyFileId(req.body);
+    const { regions, mode, format, chunkDurationSec } = req.body as {
       regions: Region[];
       mode: "full" | "selected" | "chunks";
       format: "wav" | "mp3";
       chunkDurationSec?: number;
     };
+    if (format !== "wav" && format !== "mp3") {
+      res.status(400).json({ message: "Invalid export format." });
+      return;
+    }
+    if (mode !== "full" && mode !== "selected" && mode !== "chunks") {
+      res.status(400).json({ message: "Invalid export mode." });
+      return;
+    }
     const inputPath = sourcePathFor(fileId);
     await fs.access(inputPath);
     const exportId = randomUUID();
     const safeRegions = Array.isArray(regions) ? regions : [];
 
     if (mode === "chunks") {
+      const useFixedDuration = Number.isFinite(chunkDurationSec) && (chunkDurationSec ?? 0) > 0;
+      if (!useFixedDuration && safeRegions.length === 0) {
+        res.status(400).json({ message: "Chunk export needs at least one checked range, or use fixed duration." });
+        return;
+      }
       const outDir = path.join(exportsDir, exportId);
-      const chunkPaths =
-        Number.isFinite(chunkDurationSec) && (chunkDurationSec ?? 0) > 0
-          ? await exportChunksByDuration(inputPath, outDir, exportId, format, Number(chunkDurationSec))
-          : await exportChunks(inputPath, outDir, exportId, format, safeRegions);
+      const chunkPaths = useFixedDuration
+        ? await exportChunksByDuration(inputPath, outDir, exportId, format, Number(chunkDurationSec))
+        : await exportChunks(inputPath, outDir, exportId, format, safeRegions);
       const files = chunkPaths.map((item, idx) => ({
         path: `/media/exports/${exportId}/${path.basename(item)}`,
         label: `Chunk ${idx + 1}`,
@@ -143,18 +198,57 @@ app.post("/export", async (req, res) => {
 
     const outputPath = path.join(exportsDir, `${exportId}.${format}`);
     if (mode === "selected") {
+      if (safeRegions.length === 0) {
+        res.status(400).json({ message: "Selected export needs at least one checked range." });
+        return;
+      }
       await exportSelectedRegions(inputPath, outputPath, safeRegions);
     } else {
       await exportFullAudio(inputPath, outputPath);
     }
     res.json({ files: [{ path: `/media/exports/${exportId}.${format}`, label: `Export ${format.toUpperCase()}` }] });
   } catch (error) {
-    res.status(500).json({ message: (error as Error).message });
+    sendError(res, error);
   }
 });
+
+/** Remove files / directories older than `maxAgeMs` from the given directory (non-recursive for files, recursive for sub-dirs). */
+const cleanupOldFiles = async (dir: string, maxAgeMs: number) => {
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const now = Date.now();
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      try {
+        const stat = await fs.stat(fullPath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          if (entry.isDirectory()) {
+            await fs.rm(fullPath, { recursive: true, force: true });
+          } else {
+            await fs.unlink(fullPath);
+          }
+        }
+      } catch { /* file may have been deleted concurrently */ }
+    }
+  } catch { /* directory may not exist yet */ }
+};
+
+const CLEANUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // every 15 minutes
+
+const runCleanup = async () => {
+  await Promise.all([
+    cleanupOldFiles(uploadsDir, CLEANUP_MAX_AGE_MS),
+    cleanupOldFiles(processedDir, CLEANUP_MAX_AGE_MS),
+    cleanupOldFiles(exportsDir, CLEANUP_MAX_AGE_MS),
+  ]);
+};
 
 ensurePaths().then(() => {
   app.listen(port, () => {
     console.log(`Audio backend listening at http://localhost:${port}`);
   });
+  // Run cleanup on startup and then periodically
+  void runCleanup();
+  setInterval(() => void runCleanup(), CLEANUP_INTERVAL_MS);
 });

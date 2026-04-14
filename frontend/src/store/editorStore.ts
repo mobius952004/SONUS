@@ -6,6 +6,8 @@ type Snapshot = {
   filters: FilterConfig;
 };
 
+const MAX_HISTORY = 50;
+
 type EditorState = {
   fileId: string | null;
   sourceUrl: string | null;
@@ -16,6 +18,8 @@ type EditorState = {
   past: Snapshot[];
   future: Snapshot[];
   setAudioFile: (fileId: string, sourceUrl: string) => void;
+  /** Update fileId/sourceUrl without clearing regions, selection, or undo history. */
+  updateFileId: (fileId: string, sourceUrl: string) => void;
   setPlaybackRate: (rate: number) => void;
   setSelectedRegion: (id: string | null) => void;
   commitRegions: (regions: Region[]) => void;
@@ -24,7 +28,7 @@ type EditorState = {
   redo: () => void;
 };
 
-const defaultFilters: FilterConfig = {
+export const defaultFilters: FilterConfig = {
   passType: "none",
   passFrequency: 1000,
   echoEnabled: false,
@@ -60,13 +64,15 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       past: [],
       future: [],
     }),
+  updateFileId: (fileId, sourceUrl) =>
+    set({ fileId, sourceUrl }),
   setPlaybackRate: (rate) => set({ playbackRate: rate }),
   setSelectedRegion: (id) => set({ selectedRegionId: id }),
   commitRegions: (regions) => {
     const state = get();
     set({
       regions,
-      past: [...state.past, snapshotFrom(state)],
+      past: [...state.past, snapshotFrom(state)].slice(-MAX_HISTORY),
       future: [],
     });
   },
@@ -74,7 +80,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const state = get();
     set({
       filters,
-      past: [...state.past, snapshotFrom(state)],
+      past: [...state.past, snapshotFrom(state)].slice(-MAX_HISTORY),
       future: [],
     });
   },
@@ -86,7 +92,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       regions: previous.regions,
       filters: previous.filters,
       past: state.past.slice(0, -1),
-      future: [snapshotFrom(state), ...state.future],
+      future: [snapshotFrom(state), ...state.future].slice(0, MAX_HISTORY),
     });
   },
   redo: () => {
