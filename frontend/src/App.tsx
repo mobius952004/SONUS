@@ -24,7 +24,7 @@ import { defaultFilters, useEditorStore } from "./store/editorStore";
 import type { AudioAnalysis, DatasetChunkMeta, ExportFormat, ExportMode, LoudnessMeasurement, Region } from "./types";
 
 const ACCEPT_TYPES = ".mp3,.wav,.amr,.m4a,.aac,.ogg,.webm";
-const MAX_FILE_SIZE = 50 * 1024 * 1024;
+const MAX_FILE_SIZE = 200 * 1024 * 1024;
 type BatchItem = {
   id: string;
   name: string;
@@ -466,7 +466,7 @@ function App() {
     const file = event.target.files?.[0];
     if (!file) return;
     if (file.size > MAX_FILE_SIZE) {
-      setErrorModal("Max file size is 50MB.");
+      setErrorModal("Max file size is 200MB.");
       return;
     }
     setBusy("Uploading and standardizing...");
@@ -780,7 +780,7 @@ function App() {
           currentFileId: "",
           currentPath: "",
           status: "error",
-          error: "File too large (>50MB).",
+          error: "File too large (>200MB).",
         });
         continue;
       }
