@@ -37,8 +37,9 @@ export const exportAudio = async (
   mode: ExportMode,
   format: ExportFormat,
   chunkDurationSec?: number,
+  originalFilename?: string,
 ) => {
-  const { data } = await api.post("/export", { fileId, regions, mode, format, chunkDurationSec });
+  const { data } = await api.post("/export", { fileId, regions, mode, format, chunkDurationSec, originalFilename });
   return data as { files: Array<{ path: string; label: string }> };
 };
 
@@ -94,6 +95,7 @@ export const exportDataset = async (
   label: string,
   speakerId: string,
   targetLufs: number | null,
+  originalFilename?: string,
 ) => {
   const { data } = await api.post("/export-dataset", {
     fileId,
@@ -102,10 +104,17 @@ export const exportDataset = async (
     label,
     speakerId,
     targetLufs,
+    originalFilename,
   });
   return data as {
     files: Array<{ path: string; label: string }>;
     manifest: DatasetChunkMeta[];
     manifestUrl: string;
   };
+};
+
+/** Resample audio to a target sample rate (Hz) */
+export const resampleAudio = async (fileId: string, targetSampleRate: number) => {
+  const { data } = await api.post("/resample", { fileId, targetSampleRate });
+  return data as { fileId: string; path: string };
 };

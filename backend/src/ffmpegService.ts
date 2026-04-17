@@ -580,3 +580,23 @@ export const exportDatasetChunks = async (
 
   return { manifest, manifestPath };
 };
+
+/* ------------------------------------------------------------------ */
+/*  Resampling: Convert audio to a target sample rate                  */
+/* ------------------------------------------------------------------ */
+
+export const resampleAudio = async (
+  inputPath: string,
+  outputPath: string,
+  targetSampleRate: number,
+): Promise<void> => {
+  await ensureDir(path.dirname(outputPath));
+  const safeRate = Math.max(8000, Math.min(96000, Math.round(targetSampleRate)));
+  await runFfmpeg([
+    "-i", inputPath,
+    "-ar", `${safeRate}`,
+    "-ac", "1",
+    "-c:a", "pcm_s16le",
+    outputPath,
+  ]);
+};

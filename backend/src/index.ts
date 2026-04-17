@@ -17,6 +17,7 @@ import {
   measureLoudness,
   normalizeLoudness,
   removeTimeRangesFromAudio,
+  resampleAudio,
   type FiltersPayload,
   type Region,
 } from "./ffmpegService";
@@ -71,6 +72,15 @@ const sendError = (res: express.Response, error: unknown) => {
   const err = error as Error & { statusCode?: number };
   const status = typeof err.statusCode === "number" ? err.statusCode : 500;
   res.status(status).json({ message: err.message || "Request failed." });
+};
+
+/** Strip extension, replace non-alphanumeric chars, truncate — produces a safe file-name prefix. */
+const sanitizeBaseName = (raw: string | undefined, fallback: string): string => {
+  if (!raw || typeof raw !== "string") return fallback;
+  const noExt = raw.replace(/\.[^.]+$/, "");            // drop extension
+  const clean = noExt.replace(/[^a-zA-Z0-9_-]/g, "_");  // safe chars only
+  const trimmed = clean.replace(/^_+|_+$/g, "");         // trim leading/trailing _
+  return trimmed.length > 0 ? trimmed.slice(0, 60) : fallback;
 };
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -163,11 +173,12 @@ app.post("/keep-ranges", async (req, res) => {
 app.post("/export", async (req, res) => {
   try {
     const fileId = readBodyFileId(req.body);
-    const { regions, mode, format, chunkDurationSec } = req.body as {
+    const { regions, mode, format, chunkDurationSec, originalFilename } = req.body as {
       regions: Region[];
       mode: "full" | "selected" | "chunks";
       format: "wav" | "mp3";
       chunkDurationSec?: number;
+      originalFilename?: string;
     };
     if (format !== "wav" && format !== "mp3") {
       res.status(400).json({ message: "Invalid export format." });
@@ -189,9 +200,10 @@ app.post("/export", async (req, res) => {
         return;
       }
       const outDir = path.join(exportsDir, exportId);
+      const baseName = sanitizeBaseName(originalFilename, exportId);
       const chunkPaths = useFixedDuration
-        ? await exportChunksByDuration(inputPath, outDir, exportId, format, Number(chunkDurationSec))
-        : await exportChunks(inputPath, outDir, exportId, format, safeRegions);
+        ? await exportChunksByDuration(inputPath, outDir, baseName, format, Number(chunkDurationSec))
+        : await exportChunks(inputPath, outDir, baseName, format, safeRegions);
       const files = chunkPaths.map((item, idx) => ({
         path: `/media/exports/${exportId}/${path.basename(item)}`,
         label: `Chunk ${idx + 1}`,
@@ -297,12 +309,14 @@ app.post("/export-dataset", async (req, res) => {
     }
     const exportId = randomUUID();
     const outDir = path.join(exportsDir, exportId);
+    const { originalFilename: rawName } = req.body as { originalFilename?: string };
+    const baseName = sanitizeBaseName(rawName, exportId);
     const safeLabel = typeof label === "string" ? label : "";
     const safeSpeakerId = typeof speakerId === "string" ? speakerId : "";
     const safeLufs = targetLufs !== null && Number.isFinite(targetLufs) ? targetLufs! : null;
 
     const { manifest } = await exportDatasetChunks(
-      inputPath, outDir, exportId, format, safeRegions,
+      inputPath, outDir, baseName, format, safeRegions,
       safeLabel, safeSpeakerId, safeLufs,
     );
 
@@ -319,6 +333,23 @@ app.post("/export-dataset", async (req, res) => {
       manifest,
       manifestUrl: `/media/exports/${exportId}/manifest.json`,
     });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/** Resample audio to a target sample rate */
+app.post("/resample", async (req, res) => {
+  try {
+    const fileId = readBodyFileId(req.body);
+    const { targetSampleRate } = req.body as { targetSampleRate?: number };
+    const inputPath = sourcePathFor(fileId);
+    await fs.access(inputPath);
+    const safeRate = Number.isFinite(targetSampleRate) ? targetSampleRate! : 16000;
+    const outputId = randomUUID();
+    const outputPath = sourcePathFor(outputId);
+    await resampleAudio(inputPath, outputPath, safeRate);
+    res.json({ fileId: outputId, path: `/media/processed/${outputId}.wav` });
   } catch (error) {
     sendError(res, error);
   }

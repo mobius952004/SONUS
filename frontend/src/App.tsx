@@ -15,6 +15,7 @@ import {
   normalizeAudio,
   processAudio,
   removeRangesFromAudio,
+  resampleAudio,
   uploadAudio,
 } from "./api";
 import { hasOverlap, isValidRange, nextRegionWindow, withUpdatedRegion } from "./lib/regions";
@@ -93,6 +94,9 @@ function App() {
   const [datasetExportFormat, setDatasetExportFormat] = useState<ExportFormat>("wav");
   const [datasetExports, setDatasetExports] = useState<Array<{ path: string; label: string }>>([]);
   const [datasetManifest, setDatasetManifest] = useState<DatasetChunkMeta[] | null>(null);
+
+  // Resampling state
+  const [resampleTargetRate, setResampleTargetRate] = useState(22050);
 
   const {
     fileId,
@@ -537,6 +541,9 @@ function App() {
       setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
       setWavePreviewMode("current");
       setAnalysis(null);
+      // Clear regions so stale markers don't persist on the new (shorter) waveform
+      commitRegions([]);
+      setSelectedExportRegionIds([]);
     } catch (error) {
       setErrorModal(getApiErrorMessage(error));
     } finally {
@@ -554,6 +561,9 @@ function App() {
       setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
       setWavePreviewMode("current");
       setAnalysis(null);
+      // Clear regions so stale markers don't persist on the new (cropped) waveform
+      commitRegions([]);
+      setSelectedExportRegionIds([]);
     } catch (error) {
       setErrorModal(getApiErrorMessage(error));
     } finally {
@@ -603,6 +613,7 @@ function App() {
         exportMode,
         exportFormat,
         useFixedDuration ? fixedChunkDurationSec : undefined,
+        lastUploadedFileName ?? undefined,
       );
       setExports(result.files);
 
@@ -726,9 +737,28 @@ function App() {
         datasetLabel,
         datasetSpeakerId,
         datasetNormalize ? datasetTargetLufs : null,
+        lastUploadedFileName ?? undefined,
       );
       setDatasetExports(result.files);
       setDatasetManifest(result.manifest);
+    } catch (error) {
+      setErrorModal(getApiErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // --- Resample handler ---
+  const runResample = async () => {
+    if (!fileId) return;
+    setBusy(`Resampling to ${resampleTargetRate} Hz...`);
+    try {
+      const result = await resampleAudio(fileId, resampleTargetRate);
+      updateFileId(result.fileId, mediaUrl(result.path));
+      setExports([]);
+      setProcessedPreviews((prev) => [{ fileId: result.fileId, path: result.path, createdAt: Date.now() }, ...prev]);
+      setWavePreviewMode("current");
+      setAnalysis(null);
     } catch (error) {
       setErrorModal(getApiErrorMessage(error));
     } finally {
@@ -1076,7 +1106,7 @@ function App() {
                 Select None
               </button>
             </div>
-            <div className="space-y-2">
+            <div className="max-h-80 space-y-2 overflow-y-auto rounded border border-slate-100 p-1">
               {regions.map((region) => (
                 <div
                   key={region.id}
@@ -1506,6 +1536,38 @@ function App() {
               </button>
               <p className="text-xs text-slate-500">
                 Detects speech via silence gap inversion. Creates regions for all speech segments. Existing regions are replaced.
+              </p>
+            </div>
+          </div>
+
+          <div className="panel">
+            <h2 className="panel-title">Resample Audio</h2>
+            <div className="space-y-2 text-sm">
+              <p className="text-xs text-slate-500">
+                Ensure all audio files share the same sample rate for consistent dataset quality.
+                {analysis ? (
+                  <span className="ml-1 font-medium text-slate-700">Current: {analysis.sampleRate} Hz</span>
+                ) : null}
+              </p>
+              <label className="block">
+                Target Sample Rate (Hz)
+                <select
+                  className="field mt-1"
+                  value={resampleTargetRate}
+                  onChange={(e) => setResampleTargetRate(Number(e.target.value))}
+                >
+                  <option value={8000}>8000 Hz (telephony)</option>
+                  <option value={16000}>16000 Hz (speech models)</option>
+                  <option value={22050}>22050 Hz (TTS / vocoder)</option>
+                  <option value={44100}>44100 Hz (CD quality)</option>
+                  <option value={48000}>48000 Hz (studio)</option>
+                </select>
+              </label>
+              <button className="btn w-full" onClick={runResample} disabled={!fileId}>
+                Resample to {resampleTargetRate} Hz
+              </button>
+              <p className="text-xs text-slate-500">
+                Converts audio to the selected sample rate (mono, 16-bit PCM). All chunks exported afterward will inherit this rate.
               </p>
             </div>
           </div>
