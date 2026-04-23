@@ -48,6 +48,8 @@ function App() {
   const dragSelectCleanupRef = useRef<(() => void) | null>(null);
   const hydratedRef = useRef(false);
   const lastUiTickRef = useRef(0);
+  /** True while we are performing the startup HEAD validation — WaveSurfer load errors during this window should not pop an error modal. */
+  const suppressWaveErrorRef = useRef(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showSpectrogram, setShowSpectrogram] = useState(false);
   /** When true, user can drag on the waveform to create new ranges (resize/drag existing regions always works). */
@@ -120,9 +122,12 @@ function App() {
     hydratedRef.current = true;
     const saved = loadPersistedState();
     if (!saved?.fileId || !saved.sourceUrl) return;
+    // Suppress WaveSurfer load errors while we validate the persisted session
+    suppressWaveErrorRef.current = true;
     // Validate the persisted file still exists on the server before restoring
     fetch(saved.sourceUrl, { method: "HEAD" })
       .then((res) => {
+        suppressWaveErrorRef.current = false;
         if (!res.ok) {
           clearPersistedState();
           return;
@@ -150,6 +155,8 @@ function App() {
         setLastUploadedFileName(saved.lastUploadedFileName ?? null);
       })
       .catch(() => {
+        // Server is unreachable — clear all saved state so nothing tries to reload stale URLs
+        suppressWaveErrorRef.current = false;
         clearPersistedState();
       });
   }, []);
@@ -399,9 +406,22 @@ function App() {
     if (!activeWaveUrl || !waveSurferRef.current) return;
     const ws = waveSurferRef.current as any;
     ws.load(activeWaveUrl).catch((error: Error & { name?: string }) => {
-      if (error?.name !== "AbortError") {
-        setErrorModal(error.message || "Failed to load audio waveform.");
+      if (error?.name === "AbortError") return;
+      // "Failed to fetch" is a network-level error (server down / file deleted).
+      // During startup validation this is expected — suppress the modal and wipe
+      // the stale session so the app opens cleanly on the next load.
+      const isNetworkError =
+        error instanceof TypeError && error.message.toLowerCase().includes("failed to fetch");
+      if (isNetworkError || suppressWaveErrorRef.current) {
+        clearPersistedState();
+        useEditorStore.setState({ fileId: null, sourceUrl: null, regions: [], selectedRegionId: null, past: [], future: [] });
+        setProcessedPreviews([]);
+        setOriginalPreview(null);
+        setAnalysis(null);
+        setExports([]);
+        return;
       }
+      setErrorModal(error.message || "Failed to load audio waveform.");
     });
   }, [activeWaveUrl]);
 
@@ -625,9 +645,15 @@ function App() {
       }
 
       if (autoDownloadOnExport && result.files.length > 0) {
-        const first = result.files[0];
-        const filename = first.path.split("/").pop() ?? `export-1.${exportFormat}`;
-        await downloadViaBlob(mediaUrl(first.path), filename);
+        for (let i = 0; i < result.files.length; i++) {
+          const file = result.files[i];
+          const filename = file.path.split("/").pop() ?? `export-${i + 1}.${exportFormat}`;
+          await downloadViaBlob(mediaUrl(file.path), filename);
+          // Brief pause between downloads so browsers don't suppress the queue
+          if (i < result.files.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
+        }
       }
     } catch (error) {
       if (previewWindow) previewWindow.close();
@@ -1380,7 +1406,7 @@ function App() {
                 Auto-download all exported files/chunks
               </label>
               <p className="text-xs text-slate-600">
-                After chunk export, every part is listed below—use Download or Open for each. Browsers often allow only one automatic download unless you allow multiple downloads for this site.
+                When enabled, all chunks are downloaded automatically one after another. Each chunk also appears in the list below where you can re-download or open individual files.
               </p>
               <label className="flex items-center gap-2">
                 <input type="checkbox" checked={openPreviewOnExport} onChange={(e) => setOpenPreviewOnExport(e.target.checked)} />
